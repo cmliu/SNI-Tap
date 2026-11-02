@@ -1,1 +1,10 @@
-PySide6>=6.7
+# 运行时零第三方依赖。
+#
+# GUI 使用 Python 标准库 tkinter，网络转发与嗅探使用标准库 asyncio / socket，
+# 因此本文件不含任何需要 pip 安装的包，`pip install -r requirements.txt` 是空操作。
+#
+# 开发与打包的额外要求（不属于运行时依赖，不写入本文件）：
+#   pyinstaller>=6.0    # 仅用于生成 dist/SNI-Tap.exe
+#
+# 环境前提：必须使用自带 tkinter 的 CPython（Windows 官方安装包默认包含）。
+# WorkBuddy 内置解释器未编译 tkinter，既不能运行 GUI 也不能打包。

@@ -7,22 +7,23 @@ import sys
 
 
 def main() -> int:
+    """启动 GUI 并进入事件循环。
+
+    Returns:
+        进程退出码；Tk 主循环正常结束时为 0。
+    """
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    from PySide6.QtWidgets import QApplication
+    # 必须在 tk.Tk() 之前开启 DPI 感知，create_root() 内部已按此顺序执行
+    from snitap.gui.main_window import MainWindow, create_root
 
-    from snitap.gui.main_window import MainWindow, apply_default_font
-
-    app = QApplication(sys.argv)
-    app.setApplicationName("SNI域名探测器")
-    app.setApplicationDisplayName("SNI域名探测器")
-    apply_default_font(app)
-    window = MainWindow()
-    window.show()
-    return app.exec()
+    root = create_root()
+    window = MainWindow(root)
+    window.run()
+    return 0
 
 
 if __name__ == "__main__":

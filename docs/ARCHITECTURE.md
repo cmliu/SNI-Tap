@@ -8,23 +8,26 @@
 
 ## 1. 技术选型
 
-### 主推荐：Python 3.11+ asyncio + PySide6
+### 主推荐：Python 3.11+ asyncio + tkinter
+
+> 迁移说明：v1 定稿时 GUI 选型为 PySide6；后因单文件 exe 达 24.7 MB，经视觉
+> 样张逐像素评审后全量迁移到标准库 tkinter，exe 降至约 9.1 MB。网络层选型未变。
 
 | 评估点 | 结论 |
 |---|---|
 | TCP 长连接双向转发 | `asyncio.start_server` + `StreamReader/Writer`，双向 `drain/pump` 是最成熟的方案，无需手写 select |
 | UDP 数据报转发 | `loop.create_datagram_endpoint` + `DatagramProtocol`，天然支持「每个客户端地址一个上游 socket」的映射模型 |
 | TLS ClientHello 嗅探 | 纯字节操作（`memoryview` + 手工解析），SNI 解析与转发彻底解耦；asyncio 的流式读取天然支持「先缓冲、解析、再整体转发」的旁路模式 |
-| GUI 与网络线程模型 | GUI 主线程 + asyncio 专用线程；跨线程用 `queue.Queue` 事件投递 + Qt `QTimer` 轮询，最简单可靠、无信号槽跨线程坑 |
-| 打包分发 | PyInstaller `--onefile` 单 exe，PySide6 已被良好支持；仅 1 个第三方依赖（PySide6），解析全部手写 |
+| GUI 与网络线程模型 | GUI 主线程 + asyncio 专用线程；跨线程用 `queue.Queue` 事件投递 + `root.after(100ms)` 轮询，最简单可靠 |
+| 打包分发 | PyInstaller `--onefile` 单 exe；运行时零第三方依赖（tkinter 属标准库），解析全部手写 |
 
-一句话理由：**网络需求（TCP 流 + UDP 数据报 + 流式嗅探）全是 asyncio 原生强项，用户熟悉 Python，PySide6 满足高 UI 要求且打包成熟。**
+一句话理由：**网络需求（TCP 流 + UDP 数据报 + 流式嗅探）全是 asyncio 原生强项，用户熟悉 Python；GUI 用标准库 tkinter 可把单文件 exe 压到 10 MB 以内。**
 
 ### 备选
 
 | 方案 | 优点 | 不选为主因 |
 |---|---|---|
-| 备选 A：Python + tkinter | 零第三方依赖 | UI 观感与布局能力弱，与用户对 UI/UX 的高要求冲突 |
+| 备选 A：Python + PySide6 | UI 观感与布局能力最强（QSS 圆角、原生高 DPI、富文本表格） | 单文件 exe 24.7 MB，裁剪极限仍 23.8 MB，对一个小工具过重 |
 | 备选 B：Node.js + Electron | 用户熟悉 JS；net/dgram 即够用 | 包体 80MB+、内存占用高，对这种小工具过度 |
 
 > SNI 解析器完全手写（约 150 行），不引入 scapy/dpkt/pyshark 等重依赖——它们面向抓包场景，对「单条流旁路解析」反而笨重且带风险。
@@ -68,7 +71,10 @@ SNI-Tap/
         ├── __init__.py
         ├── main_window.py      # 主窗口：布局、输入框、按钮、tcping 显示
         ├── log_panel.py        # 日志区组件（环形上限 5000 行，防内存膨胀）
-        └── stats_table.py      # 统计列表组件（QTableWidget，按次数排序）
+        ├── log_panel.py        # SNI 嗅探日志（tk.Text + tag 富文本）
+        ├── stats_table.py      # 统计列表组件（Canvas 自绘三色表格，按次数排序）
+        ├── theme.py            # 暗/亮配色令牌 + 系统亮暗探测 + 字族探测
+        └── widgets.py          # 共用件：DPI 缩放、极细滚动条、输入框工厂
 ```
 
 各模块职责一句话：
@@ -156,8 +162,8 @@ stateDiagram-v2
 
 ```mermaid
 flowchart LR
-    subgraph 主线程[Qt 主线程]
-        GUI[MainWindow] -- QTimer 100ms 拉取 --> Q[queue.Queue 事件队列]
+    subgraph 主线程[Tk 主线程]
+        GUI[MainWindow] -- root.after 100ms 拉取 --> Q[queue.Queue 事件队列]
         GUI -- 命令队列+call_soon_threadsafe --> CMD[CommandChannel]
     end
     subgraph worker线程[asyncio 线程]
@@ -171,8 +177,8 @@ flowchart LR
 
 | 决策点 | 选择 | 一句话理由 |
 |---|---|---|
-| 事件循环位置 | **独立线程**（`worker.py` 中 `new_event_loop` + `run_forever`） | GUI 留在主线程是 Qt 铁律；隔离后 worker 可整体 create/destroy |
-| 网络层→GUI | 事件对象 `queue.Queue.put_nowait`，GUI `QTimer(100ms)` 批量 drain（一次最多 200 条日志，多余的合并进统计） | 比 Qt 信号槽跨线程 emit 更可控，天然批量、天然背压 |
+| 事件循环位置 | **独立线程**（`worker.py` 中 `new_event_loop` + `run_forever`） | GUI 必须留在主线程（Tk 线程不安全）；隔离后 worker 可整体 create/destroy |
+| 网络层→GUI | 事件对象 `queue.Queue.put_nowait`，GUI 用 `root.after(100ms)` 链式轮询批量 drain（一次最多 400 条，多余的留到下一轮） | 不依赖任何 GUI 框架的信号机制，天然批量、天然背压 |
 | GUI→网络层 | 命令对象经 `loop.call_soon_threadsafe` 投递 | 官方推荐的跨线程唤醒方式 |
 | 统计数据所有权 | `Stats` 只在 worker 线程内修改；GUI 只读事件携带的**不可变快照** | 无锁设计 |
 
@@ -199,30 +205,33 @@ flowchart LR
 ## 7. GUI 布局说明（线框图见对话内渲染稿）
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│ ① 配置区（水平一行，QHBoxLayout，固定高度）                      │
-│  本地端口:[1234]  目标地址:[cf.090227.xyz]  目标端口:[443]      │
-│  [ ▶ 转发监听 ]                                               │
-│  输入框带 placeholder（空时灰字提示默认值语义），固定合理宽度      │
-├──────────────────────────────────────────────────────────────┤
-│ ② 状态区（一行，与配置区同高或稍矮）                              │
-│  ● 监听中   延迟: 23.4 ms (→ 104.16.x.x:443)    [清除日志]     │
-│  左：圆点状态灯+文字；中：tcping 大字号显示(绿色/红色)；           │
-│  右：「清除日志」按钮（唯一的辅助操作，克制）                      │
-├──────────────────────────────────────────────────────────────┤
-│ ③ 上：域名统计（QTableWidget 2列: 域名 | 次数）                  │
-│  按次数降序实时排序 · 新嗅探先入表再排序 · 双击复制单元格          │
-├──────────────────────────────────────────────────────────────┤
-│ ③ 下：SNI 嗅探日志（QPlainTextEdit 只读，QSplitter 垂直分割）    │
+┌─────────────────────────────────────────────────────────────────┐
+│① 配置区（水平一行，固定高度）                                  │
+│  listen:[1234]   →   [cf.090227.xyz]           [ ▶ 转发监听 ]   │
+│  目标框为 host / host:port 合一输入（端口省略默认 443）         │
+│  placeholder：「host 或 host:port（端口省略默认 443）」         │
+├─────────────────────────────────────────────────────────────────┤
+│② 状态区（一行）                                                │
+│  ● 监听中    ping 23.4ms │ peer 104.16.132.229:443   「提示」   │
+│  左=状态灯+文字；ping / peer 前缀 muted、数值 green / cyan      │
+│  右=notice 提示位（错误红 / 普通 muted，5s 自动消失）           │
+├─────────────────────────────────────────────────────────────────┤
+│③ 左：SNI 嗅探日志（tk.Text 只读，PanedWindow 水平分割）        │
+│  面板头：── sni log ──（绿）  上限 5000 行（dim）  [清除]       │
 │  格式: 14:32:05  api.xx.com   · 等宽字体                        │
-│  自动滚动到底 · 上限5000行,超出丢最旧                            │
-├──────────────────────────────────────────────────────────────┤
-│ ④ 状态栏: 状态|TCP连接数|UDP映射数|嗅探总数|目标 xxx:443          │
-└──────────────────────────────────────────────────────────────┘
+│  自动滚动到底 · 上限 5000 行，超出丢最旧                        │
+├─────────────────────────────────────────────────────────────────┤
+│③ 右：域名统计（StatsTable，Canvas 自绘 3 列）                  │
+│  列：域名 | 条形 | 次数 · 按次数降序 · 双击复制域名             │
+│  条形 = ▮ × n（n = round(count/max×10)，至少 1）                │
+│  底部 footer：total N（dim）                                    │
+├─────────────────────────────────────────────────────────────────┤
+│④ 状态栏: tcp N │ udp N │ sni N      Ctrl + L 清屏 · Enter 启停 │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 布局要点：
-- **主区上下分割（QSplitter 垂直方向，可拖动）**【用户已确认】：**统计表在上（约 40%），滚动日志在下（约 60%）**；统计常驻顶部一眼可见，日志大视野居下滚动。
+- **主区左右 5:5 分栏（PanedWindow 水平方向，可拖动）**【用户已确认】：**左＝SNI 嗅探日志，右＝域名统计**；两栏最小宽 280，拖动 sash 可改变比例。空态时日志区显示 dim 占位提示「等待嗅探到 SNI 域名…」。
 - 时间戳格式 `HH:mm:ss`（当天日期无信息量）；统计列表双击可复制域名。
 - 运行中：输入框禁用、按钮文字变「■ 停止」（红调）；停止后恢复。
 - v1 **不做**日志导出、不做设置持久化、不做托盘——保持克制，列为待确认项。
@@ -233,8 +242,8 @@ flowchart LR
 
 | # | 决策项 | 结论 |
 |---|---|---|
-| 1 | 技术选型 | ✅ Python 3.11+ asyncio + PySide6 |
-| 2 | GUI 主区布局 | ✅ **上下分割**（**统计在上、滚动日志在下**，QSplitter 垂直可拖动） |
+| 1 | 技术选型 | ✅ Python 3.11+ asyncio + tkinter（v1 原定 PySide6；后因单文件 exe 24.7 MB 迁移到标准库 tkinter，降至 ~9.1 MB） |
+| 2 | GUI 主区布局 | ✅ **左右 5:5 分栏**（左=sniff log，右=域名统计；PanedWindow 水平可拖动改比例，两栏最小宽 280） |
 | 3 | UDP 嗅探范围 | ✅ v1 仅透明转发，QUIC SNI 嗅探留 v2 可插拔钩子 |
 | 4 | 日志导出 | v1 不做（保持克制，v2 再加） |
 | 5 | 非 TLS 流量 | 明文 HTTP 不嗅探 Host、纯透传 |
