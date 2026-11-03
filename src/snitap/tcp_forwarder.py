@@ -1,4 +1,9 @@
-"""TCP 转发引擎：监听本地端口，逐条连接转发到目标，并在前向数据上挂只读 SNI 嗅探。"""
+"""TCP 转发引擎：监听本地端口，逐条连接转发到目标，并在双向数据上挂只读嗅探。
+
+每条连接一个 :class:`TcpFlow`：上行（客户端 → 上游）嗅探 ClientHello，
+下行（上游 → 客户端）嗅探 ServerHello；连接结束时 ``finally`` 里
+``flow.close()`` 兜底合并。嗅探器没有写路径，不会干扰数据流。
+"""
 
 from __future__ import annotations
 
@@ -8,7 +13,8 @@ import logging
 from collections.abc import Callable
 
 from .config import LISTEN_HOST, AppConfig
-from .sni_sniffer import SniSniffer
+from .flow import TcpFlow
+from .protocol import ProtocolStack
 
 log = logging.getLogger(__name__)
 
@@ -17,17 +23,17 @@ _CONNECT_TIMEOUT = 10.0
 
 
 class TcpForwarder:
-    """监听 -> 建上游连接 -> 双向 pump；嗅探只发生在客户端到上游方向的前几个包。"""
+    """监听 -> 建上游连接 -> 双向 pump；嗅探只发生在握手窗口，随后零开销。"""
 
     def __init__(
         self,
         config: AppConfig,
-        on_sni: Callable[[str], None],
+        on_stack: Callable[[ProtocolStack], None],
         on_conn_change: Callable[[int], None],
         on_error: Callable[[str], None],
     ) -> None:
         self._config = config
-        self._on_sni = on_sni
+        self._on_stack = on_stack
         self._on_conn_change = on_conn_change
         self._on_error = on_error
         self._server: asyncio.AbstractServer | None = None
@@ -83,6 +89,7 @@ class TcpForwarder:
         self._safe_conn_change()
 
         upstream_writer: asyncio.StreamWriter | None = None
+        flow: TcpFlow | None = None
         try:
             try:
                 up_reader, upstream_writer = await asyncio.wait_for(
@@ -94,13 +101,15 @@ class TcpForwarder:
                 return
             self._writers.add(upstream_writer)
 
-            sniffer = SniSniffer()
+            flow = TcpFlow(self._on_stack)
             await asyncio.gather(
-                self._pump(reader, upstream_writer, sniffer),
-                self._pump(up_reader, writer, None),
+                self._pump(reader, upstream_writer, flow, "up"),
+                self._pump(up_reader, writer, flow, "down"),
                 return_exceptions=True,
             )
         finally:
+            if flow is not None:
+                flow.close()  # 嗅探窗口兜底闭合（幂等）
             if upstream_writer is not None:
                 self._writers.discard(upstream_writer)
                 _close_writer(upstream_writer)
@@ -115,9 +124,10 @@ class TcpForwarder:
         self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
-        sniffer: SniSniffer | None,
+        flow: TcpFlow,
+        direction: str,
     ) -> None:
-        """单向搬运字节；sniffer 非空时同步喂入（纯内存解析，不阻塞转发）。"""
+        """单向搬运字节；嗅探 sink 已结束时（返回 None）零开销旁路。"""
         try:
             while True:
                 data = await reader.read(_CHUNK)
@@ -125,8 +135,9 @@ class TcpForwarder:
                     break
                 writer.write(data)
                 await writer.drain()
-                if sniffer is not None and not sniffer.finished:
-                    self._sniff(sniffer, data)
+                sink = flow.sink(direction)
+                if sink is not None:
+                    sink(data)  # 内部自吞异常，绝不影响转发
         except (ConnectionError, OSError, asyncio.IncompleteReadError):
             pass
         finally:
@@ -134,19 +145,7 @@ class TcpForwarder:
                 if not writer.is_closing():
                     writer.write_eof()
 
-    # ------------------------------------------------------------ 嗅探与回调
-
-    def _sniff(self, sniffer: SniSniffer, data: bytes) -> None:
-        try:
-            sniffer.feed(data)
-        except Exception:  # 嗅探绝不能影响转发
-            log.debug("SNI 解析异常（忽略，继续转发）", exc_info=True)
-            return
-        if sniffer.finished and sniffer.sni:
-            try:
-                self._on_sni(sniffer.sni)
-            except Exception:
-                log.debug("SNI 回调异常", exc_info=True)
+    # -------------------------------------------------------------- 回调保护
 
     def _safe_conn_change(self) -> None:
         try:

@@ -9,6 +9,8 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
+from .protocol import ProtocolStack, StackRow
+
 
 def now_ts() -> str:
     """当天时间戳，格式 HH:mm:ss。"""
@@ -16,11 +18,11 @@ def now_ts() -> str:
 
 
 @dataclass(frozen=True)
-class SniEvent:
-    """嗅探到一个 SNI 域名。"""
+class StackEvent:
+    """嗅探到一条完整三层协议栈（每连接 / 每会话至多一条）。"""
 
     ts: str
-    domain: str
+    stack: ProtocolStack
 
 
 @dataclass(frozen=True)
@@ -42,13 +44,15 @@ class StateEvent:
 
 @dataclass(frozen=True)
 class StatsEvent:
-    """统计快照：域名计数（按次数降序）+ 连接数 + 嗅探总数。"""
+    """统计快照：按 (域名, 应用层, 传输层, 安全层) 聚合的行 + 连接数 + 嗅探总数。"""
 
     ts: str
-    domains: tuple[tuple[str, int], ...]
+    rows: tuple[StackRow, ...]
     tcp_conns: int
     udp_sessions: int
     total_hits: int
+    distinct: int
+    truncated: bool = False
 
 
 @dataclass(frozen=True)

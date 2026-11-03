@@ -2,8 +2,8 @@
 
 做法：本地起 echo 服务当"目标"，转发引擎指过去；验证
 1) 字节完整往返（嗅探不干扰转发）；
-2) 真实 ClientHello 能上报 SNI；
-3) 非 TLS 流量不误报；
+2) 真实 ClientHello 能上报完整三层协议栈（provisional 语义）；
+3) 非 TLS 流量零上报；
 4) UDP 数据报往返。
 """
 
@@ -18,9 +18,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 from snitap.config import AppConfig
+from snitap.protocol import ProtocolStack
 from snitap.tcp_forwarder import TcpForwarder
 from snitap.udp_forwarder import UdpForwarder
-from test_sni_sniffer import build_client_hello
+from test_tls_sniffer import build_client_hello
 
 
 class TcpForwarderTest(unittest.IsolatedAsyncioTestCase):
@@ -41,12 +42,12 @@ class TcpForwarderTest(unittest.IsolatedAsyncioTestCase):
         self.echo_server = await asyncio.start_server(handle, "127.0.0.1", 0)
         self.echo_port = self.echo_server.sockets[0].getsockname()[1]
 
-        self.snis: list[str] = []
+        self.stacks: list[ProtocolStack] = []
         self.errors: list[str] = []
         self.conn_counts: list[int] = []
         self.forwarder = TcpForwarder(
             AppConfig(listen_port=0, target_host="127.0.0.1", target_port=self.echo_port),
-            on_sni=self.snis.append,
+            on_stack=self.stacks.append,
             on_conn_change=self.conn_counts.append,
             on_error=self.errors.append,
         )
@@ -58,7 +59,7 @@ class TcpForwarderTest(unittest.IsolatedAsyncioTestCase):
         self.echo_server.close()
         await self.echo_server.wait_closed()
 
-    async def test_client_hello_passes_through_and_sni_reported(self) -> None:
+    async def test_client_hello_passes_through_and_stack_reported(self) -> None:
         payload = build_client_hello("cf.090227.xyz")
         reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
         try:
@@ -67,7 +68,13 @@ class TcpForwarderTest(unittest.IsolatedAsyncioTestCase):
             echoed = await asyncio.wait_for(reader.readexactly(len(payload)), timeout=3.0)
             self.assertEqual(echoed, payload)  # 零干扰：字节完全一致
             await asyncio.sleep(0.2)
-            self.assertEqual(self.snis, ["cf.090227.xyz"])
+            self.assertEqual(len(self.stacks), 1)
+            stack = self.stacks[0]
+            self.assertEqual(stack.sni, "cf.090227.xyz")
+            self.assertTrue(stack.provisional)  # echo 回的是 ClientHello，服务端解不出 ServerHello
+            self.assertEqual(stack.transport, "TCP")
+            self.assertEqual(stack.app, "-")
+            self.assertEqual(stack.security, "TLS1.3/A128GCM")
             self.assertEqual(self.errors, [])
         finally:
             writer.close()
@@ -82,7 +89,7 @@ class TcpForwarderTest(unittest.IsolatedAsyncioTestCase):
             echoed = await asyncio.wait_for(reader.readexactly(len(data)), timeout=3.0)
             self.assertEqual(echoed, data)
             await asyncio.sleep(0.15)
-            self.assertEqual(self.snis, [])
+            self.assertEqual(self.stacks, [])
         finally:
             writer.close()
             await writer.wait_closed()
@@ -112,10 +119,12 @@ class UdpForwarderTest(unittest.IsolatedAsyncioTestCase):
         )
         self.echo_port = self.echo_transport.get_extra_info("sockname")[1]
 
+        self.stacks: list[ProtocolStack] = []
         self.errors: list[str] = []
         self.session_counts: list[int] = []
         self.forwarder = UdpForwarder(
             AppConfig(listen_port=0, target_host="127.0.0.1", target_port=self.echo_port),
+            on_stack=self.stacks.append,
             on_session_change=self.session_counts.append,
             on_error=self.errors.append,
         )
@@ -146,6 +155,9 @@ class UdpForwarderTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(data, b"echo:hello-quic")
             self.assertGreaterEqual(max(self.session_counts, default=0), 1)
             self.assertEqual(self.errors, [])
+            # 非 QUIC 的 UDP 会话在嗅探窗口闭合前不会上报
+            await asyncio.sleep(0.2)
+            self.assertEqual(self.stacks, [])
         finally:
             transport.close()
 

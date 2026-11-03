@@ -1,10 +1,15 @@
-# 运行时零第三方依赖。
+# 运行时第三方依赖。
 #
-# GUI 使用 Python 标准库 tkinter，网络转发与嗅探使用标准库 asyncio / socket，
-# 因此本文件不含任何需要 pip 安装的包，`pip install -r requirements.txt` 是空操作。
+# v2 起 QUIC Initial 解密需要 cryptography（HKDF / AESGCM / AES-ECB 三个
+# 长期稳定原语，均为公开 API，无需锁版本上限）。缺失时 QUIC 嗅探自动
+# 优雅降级：仅输出传输层值（如 QUIC/v1），其余为 "-"，程序不崩、不噪音。
+#
+# TCP 侧 TLS 嗅探与 GUI（tkinter）仍全部使用标准库，不依赖本文件。
 #
 # 开发与打包的额外要求（不属于运行时依赖，不写入本文件）：
 #   pyinstaller>=6.0    # 仅用于生成 dist/SNI-Tap.exe
 #
 # 环境前提：必须使用自带 tkinter 的 CPython（Windows 官方安装包默认包含）。
 # WorkBuddy 内置解释器未编译 tkinter，既不能运行 GUI 也不能打包。
+
+cryptography>=44.0

@@ -1,8 +1,12 @@
-"""SNI 嗅探日志区：只读富文本、自动滚底、上限 5000 行、主题可重染。
+"""协议栈嗅探日志区：只读富文本、自动滚底、上限 5000 行、主题可重染。
+
+每行固定五段：``时间戳  域名  应用层  传输层  安全层``（两空格分隔，
+provisional 行尾加 ``?``），顺序固定为 应用层 → 传输层 → 安全层。
 
 Tk 的 ``Text`` 没有 HTML 富文本，改用 tag 实现「时间戳弱化、域名青色」；
-批量追加时先一次性 insert 整块文本，再用两条 ``tag_add`` 批量打范围，
-避免逐行三次 Tcl 调用把 100ms 的轮询窗口撑爆。
+批量追加时先一次性 insert 整块文本，再用**四条** ``tag_add`` 批量打范围
+（``dim`` 合并时间戳与传输层两个区间），禁止逐行打 tag——单批 400 行的
+耗时远低于逐行五次 Tcl 调用的写法。
 """
 
 from __future__ import annotations
@@ -10,6 +14,7 @@ from __future__ import annotations
 import tkinter as tk
 import tkinter.font as tkfont
 from collections import deque
+from dataclasses import dataclass
 from typing import Sequence
 
 from . import theme
@@ -17,16 +22,29 @@ from .widgets import SlimScrollbar, px
 
 MAX_LINES = 5000
 
-# 时间戳与域名之间的间隔（对齐原实现的 ``&nbsp;&nbsp;``）
-_GAP = "  "
+# 行内分隔符：两个空格（与 protocol.LOG_SEP 一致，GUI 层不 import 协议模块）
+_LOG_SEP = "  "
+
+
+@dataclass(frozen=True)
+class LogEntry:
+    """一行日志的五字段快照（FIX-4：定义在 GUI 层，不依赖 protocol.ProtocolStack）。"""
+
+    ts: str
+    domain: str
+    app: str
+    transport: str
+    security: str
+    provisional: bool = False
 
 
 class LogPanel(tk.Frame):
-    """SNI 嗅探日志面板。
+    """协议栈嗅探日志面板。
 
-    基于 ``tk.Text`` + 具名 tag 实现终端风富文本：时间戳 dim、域名 cyan、
-    关闭换行、自动滚底；``deque(maxlen=MAX_LINES)`` 与文本同步裁剪，
-    保证最多保留 MAX_LINES 行。切主题只需重配 tag 前景色，无需重建文本。
+    基于 ``tk.Text`` + 具名 tag 实现终端风富文本：时间戳/传输层 dim、
+    域名 cyan、应用层 muted、安全层 green、关闭换行、自动滚底；
+    ``deque(maxlen=MAX_LINES)`` 与文本同步裁剪，保证最多保留 MAX_LINES 行。
+    切主题只需重配 tag 前景色，无需重建文本。
     """
 
     def __init__(
@@ -45,7 +63,7 @@ class LogPanel(tk.Frame):
         super().__init__(master, bg=theme.current().pane, bd=0, highlightthickness=0)
         self._placeholder = placeholder
         self._placeholder_shown = False
-        self._entries: deque[tuple[str, str]] = deque(maxlen=MAX_LINES)
+        self._entries: deque[LogEntry] = deque(maxlen=MAX_LINES)
         self._nlines = 0
 
         self.text = tk.Text(
@@ -81,10 +99,12 @@ class LogPanel(tk.Frame):
     # ------------------------------------------------------------------ 主题
 
     def _configure_tags(self) -> None:
-        """按当前主题重配三套 tag 的前景色与控件配色。"""
+        """按当前主题重配五套 tag 的前景色与控件配色。"""
         t = theme.current()
-        self.text.tag_configure("ts", foreground=t.dim)
-        self.text.tag_configure("dom", foreground=t.cyan)
+        self.text.tag_configure("dim", foreground=t.dim)        # 时间戳 + 传输层
+        self.text.tag_configure("dom", foreground=t.cyan)       # 域名
+        self.text.tag_configure("app", foreground=t.muted)      # 应用层
+        self.text.tag_configure("security", foreground=t.green)  # 安全层
         self.text.tag_configure("hint", foreground=t.dim)
         self.text.configure(
             bg=t.pane,
@@ -102,51 +122,62 @@ class LogPanel(tk.Frame):
 
     # ------------------------------------------------------------------ 数据
 
-    def append_lines(self, lines: list[str]) -> None:
-        """批量追加日志行，每行格式 ``"HH:MM:SS domain"``，并滚到底部。
+    def append_lines(self, entries: Sequence[LogEntry]) -> None:
+        """批量追加日志行并滚到底部。
 
-        整块 insert 一次，随后用两条 ``tag_add`` 批量标注时间戳与域名区间，
-        单批 400 行的耗时远低于逐行打 tag 的写法。
+        整块 insert 一次，随后用四条 ``tag_add`` 批量标注
+        （dim / dom / app / security，dim 同时覆盖时间戳与传输层两个区间），
+        单批 400 行的耗时远低于逐行打 tag 的写法。**不做列对齐填充**。
 
         Args:
-            lines: 日志行列表；空列表直接返回。
+            entries: 日志条目列表；空列表直接返回。
         """
-        if not lines:
+        if not entries:
             return
         self._hide_placeholder()
 
-        parsed: list[tuple[str, str]] = []
-        for line in lines:
-            timestamp, separator, domain = line.partition(" ")
-            if not separator:
-                timestamp, domain = "", line
-            parsed.append((timestamp, domain))
-            self._entries.append((timestamp, domain))
-
         base = self._nlines
-        block = "\n".join(
-            (f"{timestamp}{_GAP}{domain}" if timestamp else domain)
-            for timestamp, domain in parsed
-        ) + "\n"
+        # (行文本, [(tag, start_col, end_col), ...])
+        rendered: list[tuple[str, list[tuple[str, int, int]]]] = []
+
+        for entry in entries:
+            mark = "?" if entry.provisional else ""
+            line = (
+                f"{entry.ts}{_LOG_SEP}{entry.domain}{_LOG_SEP}{entry.app}"
+                f"{_LOG_SEP}{entry.transport}{_LOG_SEP}{entry.security}{mark}"
+            )
+            ranges: list[tuple[str, int, int]] = []
+            pos = 0
+            for tag, text in (
+                ("dim", entry.ts),
+                ("dom", entry.domain),
+                ("app", entry.app),
+                ("dim", entry.transport),
+                ("security", entry.security),
+            ):
+                start = pos
+                pos += len(text)
+                ranges.append((tag, start, pos))
+                pos += len(_LOG_SEP)
+            rendered.append((line, ranges))
+            self._entries.append(entry)
+
+        block = "\n".join(line for line, _ in rendered) + "\n"
 
         self.text.configure(state="normal")
         self.text.insert("end", block)
 
-        ts_ranges: list[str] = []
-        dom_ranges: list[str] = []
-        for offset, (timestamp, _domain) in enumerate(parsed):
+        # 四条批量 tag_add：每条传平铺的 [start, end, start, end, …]
+        tag_ranges: dict[str, list[str]] = {"dim": [], "dom": [], "app": [], "security": []}
+        for offset, (_line, ranges) in enumerate(rendered):
             line_no = base + offset + 1
-            start = 0
-            if timestamp:
-                ts_ranges.extend((f"{line_no}.0", f"{line_no}.{len(timestamp)}"))
-                start = len(timestamp) + len(_GAP)
-            dom_ranges.extend((f"{line_no}.{start}", f"{line_no}.end"))
-        if ts_ranges:
-            self.text.tag_add("ts", *ts_ranges)
-        if dom_ranges:
-            self.text.tag_add("dom", *dom_ranges)
+            for tag, start, end in ranges:
+                tag_ranges[tag].extend((f"{line_no}.{start}", f"{line_no}.{end}"))
+        for tag in ("dim", "dom", "app", "security"):
+            if tag_ranges[tag]:
+                self.text.tag_add(tag, *tag_ranges[tag])
 
-        self._nlines += len(parsed)
+        self._nlines += len(rendered)
         self._trim()
         self.text.configure(state="disabled")
         self.text.see("end")
@@ -168,8 +199,8 @@ class LogPanel(tk.Frame):
         """当前日志行数（不含占位提示）。"""
         return self._nlines
 
-    def entries(self) -> Sequence[tuple[str, str]]:
-        """返回当前条目快照 ``(时间戳, 域名)``。"""
+    def entries(self) -> Sequence[LogEntry]:
+        """返回当前条目快照。"""
         return tuple(self._entries)
 
     # -------------------------------------------------------------- 内部实现

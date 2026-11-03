@@ -1,6 +1,7 @@
-# SNI 域名探测器（SNI-Tap）架构设计文档 v1
+# SNI 域名探测器（SNI-Tap）架构设计文档
 
-> 状态：**设计定稿**（2026-11-03 用户已确认四项决策，见第 8 节）
+> 状态：v1 设计定稿（2026-11-03）+ v2 三层嗅探增量（2026-11-03，主理人审核定稿，
+> 见第 10 节；与 v1 原文冲突处以第 10 节为准）
 > 产出：软件公司专家团 · 架构师 高见远（Gao）｜汇编：交付总监 齐活林（Qi）
 > 日期：2026-11-03
 
@@ -54,35 +55,42 @@
 ```
 SNI-Tap/
 ├── README.md
-├── requirements.txt
+├── requirements.txt            # cryptography>=44.0（v2 起 QUIC 解密依赖，缺失自动降级）
 ├── snitap.spec                 # PyInstaller 打包配置
 └── src/snitap/
     ├── __init__.py
     ├── __main__.py             # 入口：python -m snitap
     ├── config.py               # AppConfig dataclass（listen_port/target_host/target_port）
-    ├── events.py               # 事件定义 + 线程桥（EventBus：asyncio→GUI 的 queue）
-    ├── sni_sniffer.py          # TLS ClientHello 流式解析状态机（纯函数式，无 IO）
-    ├── tcp_forwarder.py        # TCP 转发引擎（listener + 每连接 pump + 嗅探旁路）
-    ├── udp_forwarder.py        # UDP 转发引擎（addr→上游 socket 映射 + 回程路由）
+    ├── protocol.py             # v2 共享契约：UNKNOWN、名称映射、ProtocolStack、StackRow
+    ├── tls_sniffer.py          # TLS 双向 hello 嗅探（纯函数 + 流式外壳，v2 取代 sni_sniffer）
+    ├── quic_crypto.py          # v2：QUIC Initial 密钥派生与解密（唯一 import cryptography）
+    ├── quic_sniffer.py         # v2：长包头 → Initial 解密 → CRYPTO 重组
+    ├── flow.py                 # v2：TcpFlow / QuicFlow 聚合器（每连接至多一条事件）
+    ├── events.py               # 事件定义 + 线程桥（asyncio→GUI 的 queue）
+    ├── tcp_forwarder.py        # TCP 转发引擎（listener + 每连接双向 pump + 嗅探旁路）
+    ├── udp_forwarder.py        # UDP 转发引擎（addr→上游 socket 映射 + 回程路由 + 嗅探）
     ├── tcping.py               # 周期性 TCP connect 测延迟
-    ├── stats.py                # 会话统计（域名计数器、连接数、嗅探总数）
+    ├── stats.py                # 会话统计（四元组计数器、连接数、嗅探总数）
     ├── worker.py               # asyncio 事件循环宿主线程（启动/停止各引擎、命令队列）
     └── gui/
         ├── __init__.py
         ├── main_window.py      # 主窗口：布局、输入框、按钮、tcping 显示
-        ├── log_panel.py        # 日志区组件（环形上限 5000 行，防内存膨胀）
-        ├── log_panel.py        # SNI 嗅探日志（tk.Text + tag 富文本）
-        ├── stats_table.py      # 统计列表组件（Canvas 自绘三色表格，按次数排序）
+        ├── log_panel.py        # 协议栈日志（tk.Text + tag 富文本，五段式行 + 4 条批量 tag_add）
+        ├── stats_table.py      # 协议栈统计表（Canvas 自绘两行式布局，四元组聚合）
         ├── theme.py            # 暗/亮配色令牌 + 系统亮暗探测 + 字族探测
         └── widgets.py          # 共用件：DPI 缩放、极细滚动条、输入框工厂
 ```
 
 各模块职责一句话：
-- **sni_sniffer**：唯一"聪明"的模块，输入字节、输出 `SNI 域名 or None or 未决`，完全可单测。
-- **tcp_forwarder / udp_forwarder**：只做 IO 和字节搬运，嗅探通过回调/钩子注入。
-- **worker**：唯一拥有事件循环的类，对外只暴露 `start(config)` / `stop()` / `event_queue`。
-- **gui**：只消费事件、渲染界面、发命令，不含任何网络逻辑。
-- **events**：两侧共享的数据类（SniEvent / TcpingEvent / StatusEvent / ConnEvent），是解耦的契约。
+- **protocol**：全项目唯一「未知值」（`UNKNOWN == "-"`）与名称映射来源，不依赖任何其他模块。
+- **tls_sniffer / quic_sniffer**：只读嗅探，输入字节 / 数据报、输出 `HelloInfo`，
+  完全可单测（QUIC 侧有独立 RFC 9001 加密夹具做端到端验证）。
+- **flow**：聚合器，双向握手合并为**一条** `ProtocolStack`（决策 D1）。
+- **tcp_forwarder / udp_forwarder**：只做 IO 和字节搬运，嗅探通过回调注入；UDP 先转发后嗅探。
+- **worker**：唯一拥有事件循环的类，对外只暴露 `start(config)` / `stop()` / `events`。
+- **gui**：只消费事件、渲染界面、发命令，不含任何网络逻辑（`LogEntry` 定义在 GUI 层）。
+- **events**：两侧共享的数据类（StackEvent / TcpingEvent / StateEvent / StatsEvent / NoticeEvent），
+  是解耦的契约。
 
 ---
 
@@ -104,12 +112,12 @@ sequenceDiagram
         S-->>L: PENDING / SNI=xxx / NOT_TLS（结果）
         L->>U: 缓冲区字节**原样**写出（无论解析结果）
     end
-    S-->>L: 最终结果（解析完成 or 放弃）
-    L->>L: 发布 SniEvent → 事件队列 → GUI
+        S-->>L: 最终结果（解析完成 or 放弃）
+    L->>L: 发布 StackEvent → 事件队列 → GUI
     loop 纯转发阶段（此后零解析开销）
         C->>L: 后续数据
         L->>U: 直接 pump
-        U->>C: 回程数据直接 pump（回程从不嗅探）
+        U->>C: 回程数据 pump（v2 起下行嗅探 ServerHello，同样只读旁路）
     end
     C->>L: FIN / EOF
     L->>U: 关闭上游，双方对闭
@@ -171,7 +179,7 @@ flowchart LR
         LOOP --> UDP[UdpForwarder]
         LOOP --> PING[Tcping]
         TCP & UDP & PING -- put_nowait --> Q
-        TCP -- SniEvent --> ST[Stats 域名计数]
+        TCP -- StackEvent --> ST[Stats 四元组计数]
     end
 ```
 
@@ -261,3 +269,93 @@ flowchart LR
 | T04 | GUI + 集成打包 | gui/*.py、样式微调、smoke 联调、snitap.spec | T03 |
 
 **共享约定**：所有事件为 `@dataclass(frozen=True)`；时间戳统一 `time.strftime("%H:%M:%S")` 本地时间；任何引擎异常只经 StatusEvent 上报，绝不抛入 GUI 线程。
+
+---
+
+## 10. v2 增量：三层协议嗅探 + 四元组统计（2026-11-03 主理人审核定稿）
+
+> 本章是 v2 实现的权威描述；与 v1 原文冲突处（如「UDP 仅透明转发」、
+> 「回程从不嗅探」）以本章为准。完整实现规格见 `.workbuddy/tmp/arch-v2-stack.md`
+> （含 FIX-1~FIX-6 主理人审核修正）。
+
+### 10.1 需求与核心决策
+
+三条硬需求：
+1. 引入 `cryptography`（仅 QUIC 解密用）；
+2. 嗅探日志每行带**应用层 / 传输层 / 安全层**的值；
+3. 统计聚合键 = `(域名, 应用层, 传输层, 安全层)`，任一层不同即独立成行。
+
+| 决策 | 内容 |
+|---|---|
+| D1 | **每连接/每会话只发一条事件**。`TcpFlow` / `QuicFlow` 聚合器在嗅探窗口闭合时（双向 finished / 连接关闭 / 3s backstop）合并成一条 `ProtocolStack`，避免「客户端最高支持」与「实际协商」各入库一次把统计灌脏 |
+| D2 | TLS 解析拆成「纯函数 + 有状态外壳」；QUIC 的握手无 5 字节 record 头，但 handshake 编号一致，直接复用 `parse_hello` 纯函数 |
+| D3 | QUIC 只解 Initial，但**双向都解**。服务端 Initial 用「客户端首个 Initial 的 DCID」派生密钥（`server in` 标签）——这是 h3 唯一能拿到协商值的路径。Handshake / 1-RTT 全加密，不碰 |
+| D4 | `cryptography` 声明为依赖，代码里优雅降级。`quic_crypto.available()` 懒加载探测；缺失时 QUIC 仍输出传输层值（`QUIC/v1`），其余为 `-`，不崩不噪音 |
+| D5 | 统计表用「行内两行」布局：第一行 域名+条形+次数，第二行全宽 dim 摘要 `app · transport · security`；行高 24→40 |
+
+合并规则：拿到 ServerHello（或服务端 Initial）→ 三层取**协商值**，`provisional=False`；
+只拿到客户端方向 → 退回客户端偏好，`provisional=True`，日志行尾加 `?`。
+`provisional` 与各 `*_source` **不进统计键**——统计表是聚合真值，日志是单次观测。
+
+### 10.2 三层模型
+
+| 层 | 取值 | 来源 |
+|---|---|---|
+| 应用层 | ALPN（`h2` / `h3` / `http/1.1` …；未知 `-`） | ClientHello / ServerHello 的 ALPN 扩展 |
+| 传输层 | `TCP` / `QUIC/v1` / `QUIC/v2` / `QUIC/draft-29` / `QUIC/vneg` / `QUIC/-` / `UDP` | 连接类型 + QUIC 长包头版本；禁止裸 `QUIC` |
+| 安全层 | `TLS1.3/A128GCM` 等；cipher 未知时只留版本 | hello 的版本 + 套件（TLS1.3 五套收录短名，1.2 走 `0x%04x` 保单射） |
+
+未知占位符全项目唯一：`protocol.UNKNOWN == "-"`。名称表必须单射，
+否则「任一层不同即分开统计」会被短名合并破坏。
+
+### 10.3 QUIC Initial 解密管线
+
+```
+UDP 数据报 → 长包头判型（long+fixed 且类型 00）
+  → version==0 → 版本协商包，记 vneg，完成
+  → parse_long_header（DCID/SCID/token(varint!)/length）
+  → 密钥：客户端包用自身 DCID（client in）；服务端包用客户端首个 Initial 的 DCID（server in）
+  → header protection（FIX-1）：先 XOR 还原 first byte，PN 长度取还原值低 2 位；
+    AAD = 还原后的 first byte + 头部 + 还原后的 PN 字节
+  → AES-GCM 解密 → 帧扫描（ACK 全 varint；CONNECTION_CLOSE 直接终止不解析，FIX-2）
+  → CRYPTO 乱序重组（offset 连续追加、乱序暂存 ≤16KB、超限放弃）
+  → 凑满 handshake 消息 → parse_hello 纯函数解析
+```
+
+尝试上限 `MAX_ATTEMPTS=4`：喂入 4 个报文仍无果即放弃（info 为 None）。
+自加密夹具**独立按 RFC 9001 附录 A 实现**，绝不反向调用被测解密函数，防假通过。
+
+### 10.4 事件与统计
+
+- `SniEvent` → `StackEvent(ts, stack)`；`StatsEvent` 改为
+  `rows: tuple[StackRow, ...]` + `distinct` + `truncated`；
+- `Stats`：`Counter[tuple]`，`add_stack` / `snapshot_rows`；
+  排序键 `(-count, domain, app, transport, security)` 全字段参与，快照逐帧稳定；
+- 上限 `Stats.MAX_ROWS = 300`，超出截断并在 footer 标注。
+
+### 10.5 GUI 变化
+
+- 日志行五段式：`ts  domain  app  transport  security`（两空格分隔，不做列对齐填充）；
+  tag 映射 `ts/transport→dim`、`domain→cyan`、`app→muted`、`security→green`；
+  整块 insert 一次 + **4 条批量 `tag_add`**（dim 合并两个区间），禁止逐行打 tag；
+- `LogEntry` 定义在 `log_panel.py`（FIX-4），`main_window._drain_events` 负责投影；
+- 统计表 `set_domains` → `set_rows`，两行式绘制；截断缓存拆 `_domain_cache` /
+  `_caption_cache` 各自失效，超 4096 条整体清空；
+- 双击复制 TSV：`domain\ttransport\tapp\tsecurity`（可直接粘进 Excel）；
+- footer：`total N · M 组`，truncated 时追加 `· 仅显示前 300 组`；
+- 面板头 `── sni log ──` → `── stack log ──`，占位文案「等待嗅探到 TLS 握手…」。
+
+### 10.6 打包变化
+
+`cryptography` 进入运行时依赖：`snitap.spec` 解除 `ssl/_ssl/_hashlib` 排除，
+`hiddenimports` 显式声明 cryptography 懒加载子模块；单文件体积预期
+9.1 MB → 14~16 MB。`requirements.txt` 按 FIX-3 写 `cryptography>=44.0`（不设上限）。
+
+### 10.7 v2 范围外（已决策）
+
+| 事项 | 理由 |
+|---|---|
+| JA3 客户端指纹 | 本质是客户端指纹而非三层值之一，塞进四元组破坏「层」语义；列为 P2 储备 |
+| 明文 HTTP 的 `Host:` 嗅探 | 沿用 v1 决策；会打开「非 TLS 不误报」的边界 |
+| QUIC Handshake / 1-RTT 包 | 全加密，需 TLS 握手密钥，收益/风险比极差 |
+| 应用层除 ALPN 外的信息 | TLS/QUIC 上应用层协议的可靠判据只有 ALPN；HTTP/2 HPACK 不可旁路解 |

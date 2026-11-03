@@ -9,9 +9,14 @@
 现在的体积主要由 Tcl/Tk 运行时构成（tcl86t.dll / tk86t.dll + tcl8.6
 脚本库约 2-3 MB），其余是 CPython 解释器与本项目代码。
 
-excludes 只剔除「本应用确定用不到」的标准库：GUI 只用 tkinter，网络只用
-asyncio/socket，没有任何序列化、数据库、归档、多进程、打包工具链的需求。
-剔除后必须真实运行 exe 验证，不能只看体积。
+v2 起 QUIC Initial 解密依赖 cryptography，OpenSSL 的 libcrypto 会随包打入，
+单文件体积预期从约 9.1 MB 增长到 14~16 MB。因此：
+- 解除 ssl / _ssl / _hashlib 的排除（cryptography 依赖 _ssl / _hashlib）；
+- hiddenimports 显式声明 cryptography 的懒加载子模块（quic_crypto 在函数
+  内 import，静态分析扫不到，必须在这里兜底）。
+
+excludes 仍剔除「本应用确定用不到」的标准库：GUI 只用 tkinter，网络只用
+asyncio/socket。剔除后必须真实运行 exe 验证，不能只看体积。
 """
 
 a = Analysis(
@@ -19,7 +24,14 @@ a = Analysis(
     pathex=['src'],
     binaries=[],
     datas=[('assets/app.ico', 'assets')],
-    hiddenimports=[],
+    hiddenimports=[
+        # quic_crypto.py 在函数内懒加载，PyInstaller 静态分析扫不到，需显式声明
+        'cryptography',
+        'cryptography.hazmat.primitives.hashes',
+        'cryptography.hazmat.primitives.kdf.hkdf',
+        'cryptography.hazmat.primitives.ciphers',
+        'cryptography.hazmat.primitives.ciphers.aead',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -46,13 +58,8 @@ a = Analysis(
         'bz2',
         'lzma',
         'tarfile',
-        # ssl / _hashlib：本项目不做 TLS（只做字节转发 + ClientHello 明文嗅探），
-        # 排除后可连带甩掉 libcrypto-3.dll(1.86MB) 与 libssl-3.dll(0.28MB)。
-        # asyncio 对 ssl 是 `try: import ssl / except ImportError: ssl = None`，
-        # 缺失时优雅降级，不影响纯 TCP/UDP 转发。
-        'ssl',
-        '_ssl',
-        '_hashlib',
+        # 注意：ssl / _ssl / _hashlib 不再排除——cryptography（QUIC 解密）
+        # 依赖 _hashlib 与 OpenSSL，排除会导致运行时 ImportError。
     ],
     noarchive=False,
 )

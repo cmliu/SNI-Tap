@@ -1,6 +1,8 @@
 """UDP 转发引擎：每个客户端地址一条上游 socket，回程按地址映射表路由。
 
-v1 仅做透明转发（QUIC/h3 不断流）；嗅探器接口预留为可插拔钩子，v2 再解 QUIC Initial。
+v2 起每个会话挂一个 :class:`QuicFlow`（QUIC Initial 双向嗅探）。
+零干扰原则：**先 ``sendto`` 后 ``_inspect``**——嗅探是纯内存旁路，
+任何异常都吞在内部，绝不影响转发字节与时机。
 """
 
 from __future__ import annotations
@@ -13,6 +15,8 @@ import time
 from collections.abc import Callable
 
 from .config import LISTEN_HOST, AppConfig
+from .flow import QuicFlow
+from .protocol import ProtocolStack
 
 log = logging.getLogger(__name__)
 
@@ -35,15 +39,17 @@ class _UpstreamProtocol(asyncio.DatagramProtocol):
 
 
 class UdpForwarder(asyncio.DatagramProtocol):
-    """本地 UDP 监听 + 客户端地址到上游 socket 的映射表。"""
+    """本地 UDP 监听 + 客户端地址到上游 socket 的映射表 + QUIC 会话嗅探。"""
 
     def __init__(
         self,
         config: AppConfig,
+        on_stack: Callable[[ProtocolStack], None],
         on_session_change: Callable[[int], None],
         on_error: Callable[[str], None],
     ) -> None:
         self._config = config
+        self._on_stack = on_stack
         self._on_session_change = on_session_change
         self._on_error = on_error
         self._transport: asyncio.DatagramTransport | None = None
@@ -90,6 +96,9 @@ class UdpForwarder(asyncio.DatagramProtocol):
         self._session_tasks.clear()
 
         for session in self._sessions.values():
+            flow: QuicFlow | None = session.get("flow")
+            if flow is not None:
+                flow.close()  # 兜底合并 / 释放兜底定时器
             transport = session.get("transport")
             if transport is not None:
                 with contextlib.suppress(Exception):
@@ -110,9 +119,11 @@ class UdpForwarder(asyncio.DatagramProtocol):
             session["last_seen"] = time.monotonic()
             transport = session.get("transport")
             if transport is not None and not transport.is_closing():
-                transport.sendto(data)
+                transport.sendto(data)  # 先转发
+                self._inspect(session, data)  # 后嗅探（零干扰）
             else:
                 session["pending"].append(data)
+                self._inspect(session, data)
             return
 
         # 新客户端：先登记并缓存首包，上游 socket 建好后补发。
@@ -120,6 +131,7 @@ class UdpForwarder(asyncio.DatagramProtocol):
             "transport": None,
             "last_seen": time.monotonic(),
             "pending": [data],
+            "flow": QuicFlow(self._on_stack),
         }
         self._safe_session_change()
         task = asyncio.ensure_future(self._open_session(addr))
@@ -132,7 +144,14 @@ class UdpForwarder(asyncio.DatagramProtocol):
             session["last_seen"] = time.monotonic()
         if self._transport is not None and not self._transport.is_closing():
             with contextlib.suppress(Exception):
-                self._transport.sendto(data, client_addr)
+                self._transport.sendto(data, client_addr)  # 先转发
+        if session is not None:
+            flow: QuicFlow | None = session.get("flow")
+            if flow is not None:
+                try:
+                    flow.feed_server(data)  # 后嗅探（零干扰）
+                except Exception:
+                    log.debug("QUIC 回程嗅探异常（忽略）", exc_info=True)
 
     async def _open_session(self, addr: tuple[str, int]) -> None:
         loop = asyncio.get_running_loop()
@@ -142,7 +161,11 @@ class UdpForwarder(asyncio.DatagramProtocol):
                 remote_addr=(self._target_ip, self._config.target_port),
             )
         except Exception as exc:
-            if self._sessions.pop(addr, None) is not None:
+            session = self._sessions.pop(addr, None)
+            if session is not None:
+                flow: QuicFlow | None = session.get("flow")
+                if flow is not None:
+                    flow.close()
                 self._safe_session_change()
             self._on_error_safe(f"UDP 上游创建失败：{exc}")
             return
@@ -170,13 +193,27 @@ class UdpForwarder(asyncio.DatagramProtocol):
             ]
             for addr in stale:
                 session = self._sessions.pop(addr, None)
-                if session is not None and session.get("transport") is not None:
-                    with contextlib.suppress(Exception):
-                        session["transport"].close()
+                if session is not None:
+                    flow: QuicFlow | None = session.get("flow")
+                    if flow is not None:
+                        flow.close()
+                    if session.get("transport") is not None:
+                        with contextlib.suppress(Exception):
+                            session["transport"].close()
             if stale:
                 self._safe_session_change()
 
-    # ------------------------------------------------------------- 回调保护
+    # ------------------------------------------------------------- 嗅探与回调
+
+    def _inspect(self, session: dict, data: bytes) -> None:
+        """把客户端方向报文喂给会话的 QuicFlow；异常绝不外抛。"""
+        flow: QuicFlow | None = session.get("flow")
+        if flow is None:
+            return
+        try:
+            flow.feed_client(data)
+        except Exception:
+            log.debug("QUIC 嗅探异常（忽略，继续转发）", exc_info=True)
 
     def _safe_session_change(self) -> None:
         try:

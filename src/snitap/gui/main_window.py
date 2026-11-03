@@ -20,10 +20,11 @@ from ..config import (
     DEFAULT_TARGET_PORT,
     AppConfig,
 )
-from ..events import NoticeEvent, SniEvent, StateEvent, StatsEvent, TcpingEvent
+from ..events import NoticeEvent, StackEvent, StateEvent, StatsEvent, TcpingEvent
+from ..stats import Stats
 from ..worker import Worker
 from . import theme, widgets
-from .log_panel import LogPanel
+from .log_panel import LogEntry, LogPanel
 from .stats_table import StatsTable
 from .widgets import px
 
@@ -54,7 +55,7 @@ LISTEN_EDIT_W = 80
 TOGGLE_MIN_W = 112
 
 TARGET_PLACEHOLDER = "host 或 host:port（端口省略默认 443）"
-LOG_PLACEHOLDER = "等待嗅探到 SNI 域名…"
+LOG_PLACEHOLDER = "等待嗅探到 TLS 握手…"
 
 # 主题令牌名 或 由主题算出实色的函数
 _PaintValue = Union[str, Callable[[theme.Theme], str]]
@@ -195,7 +196,7 @@ class MainWindow:
         self.root = root
         self._worker = Worker()
         self._state = "idle"  # idle | starting | running | stopping
-        self._last_domains: tuple[tuple[str, int], ...] = ()
+        self._last_rows: tuple = ()
         self._last_tcping: Optional[TcpingEvent] = None
         self._last_stats: Optional[StatsEvent] = None
         self._net = (0, 0, 0)
@@ -556,7 +557,7 @@ class MainWindow:
         inner.pack(fill="x", padx=px(10), pady=px(6))
 
         self.lbl_pane_title = self._label(
-            inner, "\u2500\u2500 sni log \u2500\u2500", self.fonts.small, "green", "pane"
+            inner, "\u2500\u2500 stack log \u2500\u2500", self.fonts.small, "green", "pane"
         )
         self.lbl_pane_title.pack(side="left")
 
@@ -811,13 +812,13 @@ class MainWindow:
     def _reset_session_view(self) -> None:
         """开工前清空上一轮会话的展示数据。"""
         self.log_panel.clear()
-        self._last_domains = ()
+        self._last_rows = ()
         self._last_stats = None
         self._last_tcping = None
-        self.stats_table.set_domains(())
+        self.stats_table.set_rows(())
         self._net = (0, 0, 0)
         self._render_net()
-        self.lbl_total.configure(text="total 0")
+        self.lbl_total.configure(text="total 0 · 0 组")
         self.lbl_ping_value.configure(text="--", fg=theme.current().muted)
         self._set_peer("")
 
@@ -832,7 +833,7 @@ class MainWindow:
 
     def _drain_events(self) -> None:
         """批量消费 worker 事件，减少控件重绘次数。"""
-        log_lines: list[str] = []
+        log_entries: list[LogEntry] = []
         stats: Optional[StatsEvent] = None
 
         for _ in range(_DRAIN_BATCH):
@@ -841,8 +842,19 @@ class MainWindow:
             except queue.Empty:
                 break
 
-            if isinstance(event, SniEvent):
-                log_lines.append(f"{event.ts} {event.domain}")
+            if isinstance(event, StackEvent):
+                # 把 ProtocolStack 投影成 GUI 层的 LogEntry（FIX-4）
+                stack = event.stack
+                log_entries.append(
+                    LogEntry(
+                        ts=event.ts,
+                        domain=stack.domain,
+                        app=stack.app,
+                        transport=stack.transport_label,
+                        security=stack.security,
+                        provisional=stack.provisional,
+                    )
+                )
             elif isinstance(event, TcpingEvent):
                 self._apply_tcping(event)
             elif isinstance(event, StateEvent):
@@ -859,8 +871,8 @@ class MainWindow:
             elif isinstance(event, NoticeEvent):
                 self._notice(event.message, error=(event.level == "error"))
 
-        if log_lines:
-            self.log_panel.append_lines(log_lines)
+        if log_entries:
+            self.log_panel.append_lines(log_entries)
         if stats is not None:
             self._apply_stats(stats)
 
@@ -878,12 +890,15 @@ class MainWindow:
     def _apply_stats(self, event: StatsEvent) -> None:
         """刷新统计表、底部计数与 footer。"""
         self._last_stats = event
-        if event.domains != self._last_domains:
-            self._last_domains = event.domains
-            self.stats_table.set_domains(event.domains)
+        if event.rows != self._last_rows:
+            self._last_rows = event.rows
+            self.stats_table.set_rows(event.rows)
         self._net = (event.tcp_conns, event.udp_sessions, event.total_hits)
         self._render_net()
-        self.lbl_total.configure(text=f"total {event.total_hits}")
+        footer = f"total {event.total_hits} · {event.distinct} 组"
+        if event.truncated:
+            footer += f" · 仅显示前 {Stats.MAX_ROWS} 组"
+        self.lbl_total.configure(text=footer)
 
     # ------------------------------------------------------------------ 关闭
 

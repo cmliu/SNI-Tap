@@ -1,26 +1,34 @@
-"""域名统计表：域名 / 条形 / 次数 三列，Canvas 自绘，双击复制域名。
+"""协议栈统计表：行内两行布局（域名/条形/次数 + 全宽摘要），Canvas 自绘。
 
-``ttk.Treeview`` 只能整行设色，做不到「同一行三列三种颜色」，因此用 Canvas
-自绘单元格；表头单独用 Frame 拼装以便不随内容滚动。
+``ttk.Treeview`` 只能整行设色，做不到「同一段多色」，因此用 Canvas 自绘
+单元格；表头单独用 Frame 拼装以便不随内容滚动。
 
-为支撑上千域名，绘制做了**可见行虚拟化**（只画视口内的行）与**截断宽度缓存**
-（同一宽度下不重复 ``font.measure()`` 二分）。
+行内两行布局（决策 D5，右栏约 366px 不加宽）：
+- 第一行：域名（cyan，省略号截断）+ 条形（green ▮）+ 次数（green 右对齐）；
+- 第二行：全宽 dim 摘要 ``app · transport · security``（应用层→传输层→安全层）。
+
+为支撑上千组合，绘制做了**可见行虚拟化**（只画视口内的行）与**分缓存
+截断宽度缓存**（域名与摘要各一份，宽度变化只失效对应缓存）。
 """
 
 from __future__ import annotations
 
 import tkinter as tk
 import tkinter.font as tkfont
-from typing import Optional, Sequence
+from typing import Sequence
 
 from . import theme
+from ..protocol import StackRow
 from .widgets import SlimScrollbar, px
 
-_BAR_MAX_LEN = 10  # 条形最大长度（▮ 个数）
-_BAR_COLUMN_WIDTH = 120
-_COUNT_COLUMN_WIDTH = 64
-_ROW_HEIGHT = 24
-_HEADER_HEIGHT = 26
+_BAR_MAX_LEN = 6         # 条形最大长度（▮ 个数；行高变大后缩短腾出摘要行）
+_BAR_COLUMN_WIDTH = 60
+_COUNT_COLUMN_WIDTH = 56
+_ROW_HEIGHT = 40         # 行内两行布局
+_HEADER_HEIGHT = 30
+
+# 截断缓存上限：超过整体清空，防止长会话下无界增长
+_ELIDE_CACHE_MAX = 4096
 
 
 def _elide(text: str, font: tkfont.Font, max_width: int) -> str:
@@ -41,7 +49,7 @@ def _elide(text: str, font: tkfont.Font, max_width: int) -> str:
 
 
 class StatsTable(tk.Frame):
-    """域名统计表：域名（青色、省略号截断）/ 条形（绿色 ▮）/ 次数（绿色右对齐）。"""
+    """协议栈统计表：域名（青）/ 条形（绿）/ 次数（绿），第二行全宽 dim 摘要。"""
 
     def __init__(self, master: tk.Misc, font: tkfont.Font, header_font: tkfont.Font) -> None:
         """构建统计表。
@@ -54,7 +62,7 @@ class StatsTable(tk.Frame):
         super().__init__(master, bg=theme.current().pane, bd=0, highlightthickness=0)
         self._font = font
         self._header_font = header_font
-        self._rows: list[tuple[str, int]] = []
+        self._rows: list[StackRow] = []
         self._hover_index = -1
         self._selected_index = -1
 
@@ -63,9 +71,11 @@ class StatsTable(tk.Frame):
         self._bar_col_w = px(_BAR_COLUMN_WIDTH)
         self._count_col_w = px(_COUNT_COLUMN_WIDTH)
 
-        # 截断缓存：(域名) -> 当前宽度下的省略结果；宽度变化时整体失效
-        self._elide_cache: dict[str, str] = {}
-        self._text_width = -1
+        # 双缓存（共享约定 15）：域名与摘要各自记录宽度，宽度变化只清各自缓存
+        self._domain_cache: dict[str, str] = {}
+        self._caption_cache: dict[str, str] = {}
+        self._domain_width = -1
+        self._caption_width = -1
 
         self._build_header()
         self._build_body()
@@ -73,7 +83,7 @@ class StatsTable(tk.Frame):
     # ------------------------------------------------------------------ 构建
 
     def _build_header(self) -> None:
-        """表头：透明底、muted 11px、下方 1px 分隔线，行高 26。"""
+        """表头：透明底、muted 11px、下方 1px 分隔线。"""
         t = theme.current()
         head = tk.Frame(self, bg=t.pane, height=self._header_h)
         head.pack(side="top", fill="x", padx=(0, px(8)))
@@ -86,7 +96,7 @@ class StatsTable(tk.Frame):
         self._header_labels.append(
             tk.Label(
                 domain_cell,
-                text="域名",
+                text="域名 / 协议栈",
                 bg=t.pane,
                 fg=t.muted,
                 font=self._header_font,
@@ -184,13 +194,13 @@ class StatsTable(tk.Frame):
 
     # ------------------------------------------------------------------ 数据
 
-    def set_domains(self, domains: Sequence[tuple[str, int]]) -> None:
-        """全量刷新（数据源已按次数降序）。
+    def set_rows(self, rows: Sequence[StackRow]) -> None:
+        """全量刷新（数据源已按次数降序、四元组字典序稳定排列）。
 
         Args:
-            domains: ``(域名, 次数)`` 序列，调用方保证已降序排列。
+            rows: :class:`StackRow` 序列，调用方保证已排序。
         """
-        self._rows = list(domains)
+        self._rows = list(rows)
         self._hover_index = -1
         if self._selected_index >= len(self._rows):
             self._selected_index = -1
@@ -201,16 +211,17 @@ class StatsTable(tk.Frame):
         """当前行数。"""
         return len(self._rows)
 
-    def copy_domain(self, index: int) -> None:
-        """把指定行的域名写入剪贴板。
+    def copy_row(self, index: int) -> None:
+        """把指定行写入剪贴板（TSV：domain/app/transport/security，可粘进 Excel）。
 
         Args:
             index: 行号，越界时静默忽略。
         """
         if not 0 <= index < len(self._rows):
             return
+        row = self._rows[index]
         self.clipboard_clear()
-        self.clipboard_append(self._rows[index][0])
+        self.clipboard_append(f"{row.domain}\t{row.transport}\t{row.app}\t{row.security}")
 
     # -------------------------------------------------------------- 渲染实现
 
@@ -227,7 +238,7 @@ class StatsTable(tk.Frame):
         return first, max(first, last)
 
     def _render(self) -> None:
-        """重绘可见行（虚拟化：只画视口内的行）。"""
+        """重绘可见行（虚拟化：只画视口内的行；行内两行布局）。"""
         t = theme.current()
         self.canvas.delete("row")
         width = self.canvas.winfo_width()
@@ -241,45 +252,68 @@ class StatsTable(tk.Frame):
         bar_left = width - self._count_col_w - self._bar_col_w
         domain_x = px(6)
         domain_max_w = max(px(24), bar_left - px(12))
-        if domain_max_w != self._text_width:  # 宽度变了，截断缓存整体失效
-            self._text_width = domain_max_w
-            self._elide_cache.clear()
+        caption_max_w = max(px(24), width - px(12))
+        if domain_max_w != self._domain_width:  # 宽度变了，只失效域名缓存
+            self._domain_width = domain_max_w
+            self._domain_cache.clear()
+        if caption_max_w != self._caption_width:  # 宽度变了，只失效摘要缓存
+            self._caption_width = caption_max_w
+            self._caption_cache.clear()
+        if len(self._domain_cache) + len(self._caption_cache) > _ELIDE_CACHE_MAX:
+            self._domain_cache.clear()
+            self._caption_cache.clear()
         bar_x = bar_left + px(6)
         count_x = width - px(6)
-        max_count = max((count for _, count in self._rows), default=1) or 1
+        max_count = max((row.count for row in self._rows), default=1) or 1
 
         first, last = self._visible_range(height)
         for index in range(first, last):
-            domain, count = self._rows[index]
+            row = self._rows[index]
             top = index * self._row_h
-            center = top + self._row_h / 2.0
+            line1_y = top + self._row_h * 0.32
+            line2_y = top + self._row_h * 0.72
             self.canvas.create_rectangle(
                 0, top, width, top + self._row_h,
                 fill=self._background_for(index), outline="", tags="row",
             )
+            # 第一行：域名 / 条形 / 次数
             self.canvas.create_text(
-                domain_x, center,
-                text=self._elided(domain, domain_max_w),
+                domain_x, line1_y,
+                text=self._elided_domain(row.domain, domain_max_w),
                 anchor="w", fill=t.cyan, font=self._font, tags="row",
             )
-            bar_len = max(1, round(count / max_count * _BAR_MAX_LEN))
+            bar_len = max(1, round(row.count / max_count * _BAR_MAX_LEN))
             self.canvas.create_text(
-                bar_x, center,
+                bar_x, line1_y,
                 text="\u25ae" * bar_len,
                 anchor="w", fill=t.green, font=self._font, tags="row",
             )
             self.canvas.create_text(
-                count_x, center,
-                text=str(count),
+                count_x, line1_y,
+                text=str(row.count),
                 anchor="e", fill=t.green, font=self._font, tags="row",
             )
+            # 第二行：全宽 dim 摘要（应用层 · 传输层 · 安全层）
+            self.canvas.create_text(
+                domain_x, line2_y,
+                text=self._elided_caption(row.caption(), caption_max_w),
+                anchor="w", fill=t.dim, font=self._font, tags="row",
+            )
 
-    def _elided(self, domain: str, max_width: int) -> str:
-        """带缓存的省略号截断（同一宽度下命中缓存，不做 font.measure 二分）。"""
-        cached = self._elide_cache.get(domain)
+    def _elided_domain(self, domain: str, max_width: int) -> str:
+        """带缓存的域名省略号截断（同一宽度下命中缓存，不做 font.measure 二分）。"""
+        cached = self._domain_cache.get(domain)
         if cached is None:
             cached = _elide(domain, self._font, max_width)
-            self._elide_cache[domain] = cached
+            self._domain_cache[domain] = cached
+        return cached
+
+    def _elided_caption(self, caption: str, max_width: int) -> str:
+        """带缓存的摘要省略号截断（与域名缓存互相独立）。"""
+        cached = self._caption_cache.get(caption)
+        if cached is None:
+            cached = _elide(caption, self._font, max_width)
+            self._caption_cache[caption] = cached
         return cached
 
     def _background_for(self, index: int) -> str:
@@ -326,7 +360,7 @@ class StatsTable(tk.Frame):
     def _on_double_click(self, event: tk.Event) -> None:
         index = self._index_at(event.y)
         if index >= 0:
-            self.copy_domain(index)
+            self.copy_row(index)
 
     def _on_wheel(self, event: tk.Event) -> None:
         if not self._rows:

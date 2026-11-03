@@ -12,7 +12,8 @@ import queue
 import threading
 
 from .config import LISTEN_HOST, AppConfig
-from .events import NoticeEvent, SniEvent, StateEvent, StatsEvent, TcpingEvent, now_ts
+from .events import NoticeEvent, StackEvent, StateEvent, StatsEvent, TcpingEvent, now_ts
+from .protocol import ProtocolStack
 from .stats import Stats
 from .tcp_forwarder import TcpForwarder
 from .tcping import Tcping
@@ -93,7 +94,7 @@ class Worker:
     async def _startup(self, config: AppConfig) -> None:
         self._tcp = TcpForwarder(
             config,
-            on_sni=self._on_sni,
+            on_stack=self._on_stack,
             on_conn_change=self._on_conn_change,
             on_error=self._on_error,
         )
@@ -101,6 +102,7 @@ class Worker:
 
         self._udp = UdpForwarder(
             config,
+            on_stack=self._on_stack,
             on_session_change=self._on_udp_sessions,
             on_error=self._on_error,
         )
@@ -144,19 +146,25 @@ class Worker:
     async def _stats_loop(self) -> None:
         while True:
             await asyncio.sleep(1.0)
+            rows = self._stats.snapshot_rows()
+            truncated = len(rows) > Stats.MAX_ROWS
+            if truncated:
+                rows = rows[: Stats.MAX_ROWS]
             self._emit(
                 StatsEvent(
                     ts=now_ts(),
-                    domains=self._stats.snapshot_domains(),
+                    rows=rows,
                     tcp_conns=self._stats.tcp_conns,
                     udp_sessions=self._stats.udp_sessions,
                     total_hits=self._stats.total_hits,
+                    distinct=self._stats.distinct,
+                    truncated=truncated,
                 )
             )
 
-    def _on_sni(self, domain: str) -> None:
-        self._stats.add_domain(domain)
-        self._emit(SniEvent(ts=now_ts(), domain=domain))
+    def _on_stack(self, stack: ProtocolStack) -> None:
+        self._stats.add_stack(stack)
+        self._emit(StackEvent(ts=now_ts(), stack=stack))
 
     def _on_conn_change(self, active: int) -> None:
         self._stats.tcp_conns = active
