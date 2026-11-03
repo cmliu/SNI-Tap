@@ -10,8 +10,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import pathlib
+import queue
+import socket
 import sys
+import threading
+import time
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
@@ -21,6 +26,7 @@ from snitap.config import AppConfig
 from snitap.protocol import ProtocolStack
 from snitap.tcp_forwarder import TcpForwarder
 from snitap.udp_forwarder import UdpForwarder
+from snitap.worker import Worker
 from test_tls_sniffer import build_client_hello
 
 
@@ -160,6 +166,158 @@ class UdpForwarderTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.stacks, [])
         finally:
             transport.close()
+
+
+class TcpForwarderStopTest(unittest.IsolatedAsyncioTestCase):
+    """回归：有活跃连接时 stop() 必须限时完成并释放监听端口。
+
+    背景：Python 3.12+ 的 ``Server.wait_closed()`` 会等待全部 handler 退出，
+    旧实现「先 wait 后 cancel」与尚在的 handler 互相等待——GUI 停止即冻结
+    6 秒、监听 socket 不释放、重启必报端口占用（WinError 10048）。
+    """
+
+    async def asyncSetUp(self) -> None:
+        self.release = asyncio.Event()
+        self.accepted: list[asyncio.StreamWriter] = []
+        self.spam_sockets: list[socket.socket] = []
+
+        async def blackhole(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            """目标端：接受后永不读不写（模拟停滞对端）。"""
+            self.accepted.append(writer)
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.release.wait()
+
+        self.target_server = await asyncio.start_server(blackhole, "127.0.0.1", 0)
+        target_port = self.target_server.sockets[0].getsockname()[1]
+        self.forwarder = TcpForwarder(
+            AppConfig(listen_port=0, target_host="127.0.0.1", target_port=target_port),
+            on_stack=lambda stack: None,
+            on_conn_change=lambda n: None,
+            on_error=lambda m: None,
+        )
+        await self.forwarder.start()
+        self.port = self.forwarder.port
+
+    async def asyncTearDown(self) -> None:
+        self.release.set()  # 放行黑洞 handler，让靶机侧 socket 正常关闭
+        await self.forwarder.stop()  # 幂等：测试内已 stop 则立即返回
+        for s in self.spam_sockets:
+            with contextlib.suppress(OSError):
+                s.close()
+        for writer in self.accepted:
+            writer.close()
+        self.target_server.close()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(self.target_server.wait_closed(), timeout=2.0)
+
+    async def _assert_port_reusable(self) -> None:
+        """监听端口必须已释放：同端口重新绑定成功。"""
+        rebind = await asyncio.start_server(
+            lambda r, w: None, "127.0.0.1", self.port, reuse_address=True
+        )
+        rebind.close()
+        await rebind.wait_closed()
+
+    async def test_stop_with_live_connections_is_fast_and_frees_port(self) -> None:
+        conns = [await asyncio.open_connection("127.0.0.1", self.port) for _ in range(5)]
+        try:
+            await asyncio.sleep(0.2)  # 让全部 handler 挂起在 read 上
+            t0 = time.perf_counter()
+            await self.forwarder.stop()
+            elapsed = time.perf_counter() - t0
+            self.assertLess(elapsed, 1.5)
+        finally:
+            for _, w in conns:
+                w.close()
+        await self._assert_port_reusable()
+
+    async def test_stop_with_stalled_flush_is_bounded(self) -> None:
+        def spam() -> None:
+            s: socket.socket | None = None
+            try:
+                s = socket.create_connection(("127.0.0.1", self.port), timeout=3)
+                payload = b"x" * 65536
+                for _ in range(512):  # 32MB：塞满沿途缓冲，pump 停在 drain()
+                    s.send(payload)
+            except OSError:
+                pass
+            finally:
+                if s is not None:
+                    self.spam_sockets.append(s)  # 保持停滞状态直到 tearDown
+
+        threading.Thread(target=spam, daemon=True).start()
+        await asyncio.sleep(1.5)
+        t0 = time.perf_counter()
+        await self.forwarder.stop()  # 旧实现在此永久挂起
+        elapsed = time.perf_counter() - t0
+        self.assertLess(elapsed, 3.0)
+        await self._assert_port_reusable()
+
+
+class WorkerStopTest(unittest.TestCase):
+    """回归：worker 有活跃连接时 stop() 不得长时间阻塞调用线程。
+
+    GUI 的停止按钮在 Tk 主线程调用 ``worker.stop()``：旧实现因 teardown
+    死锁会阻塞 6 秒以上（future.result(3) + join(3) 双双超时），窗口即
+    「未响应」。修复后必须远小于 1.5 秒。
+    """
+
+    def test_stop_with_active_connection_returns_quickly(self) -> None:
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(8)
+        target_port = srv.getsockname()[1]
+        accepted: list[socket.socket] = []
+        accept_run = threading.Event()
+
+        def accept_loop() -> None:
+            srv.settimeout(0.2)
+            while accept_run.is_set():
+                try:
+                    accepted.append(srv.accept()[0])
+                except OSError:
+                    pass
+
+        threading.Thread(target=accept_loop, daemon=True).start()
+
+        probe = socket.socket()  # 预占一个空闲监听端口
+        probe.bind(("127.0.0.1", 0))
+        listen_port = probe.getsockname()[1]
+        probe.close()
+
+        worker = Worker()
+        worker.start(AppConfig(listen_port=listen_port, target_host="127.0.0.1", target_port=target_port))
+        client: socket.socket | None = None
+        try:
+            deadline = time.time() + 5.0
+            running = False
+            while time.time() < deadline:
+                try:
+                    event = worker.events.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if type(event).__name__ == "StateEvent" and event.state == "running":
+                    running = True
+                    break
+            self.assertTrue(running, "worker 未在 5 秒内进入 running")
+
+            client = socket.create_connection(("127.0.0.1", listen_port), timeout=3)
+            time.sleep(0.3)  # 建立一条活跃的转发连接
+
+            t0 = time.perf_counter()
+            worker.stop(timeout=3.0)
+            elapsed = time.perf_counter() - t0
+            self.assertLess(elapsed, 1.5)
+        finally:
+            if client is not None:
+                client.close()
+            accept_run.set()
+            worker.stop(timeout=1.0)  # 幂等兜底
+            for conn in accepted:
+                with contextlib.suppress(OSError):
+                    conn.close()
+            srv.close()
 
 
 if __name__ == "__main__":

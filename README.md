@@ -133,7 +133,7 @@ python -m unittest discover -s tests -v
 - `tests/test_gui_ech.py` —— 无头 GUI 断言：日志 `ech` tag 区间、统计表标记去重、footer `ech` / `ech?` 顺序
 - `tests/test_ech_audit.py` —— QA 独立复核：环境变量真 reload 覆盖、判定边界矩阵、位置参数兼容、footer 四组合、原始字节端到端、文档前缀逐字节校验
 - `tests/ech_env_isolation.py` —— 测试支撑（非用例）：把 `snitap.config` 隔离到默认名单基线，避免开发机导出 `SNITAP_ECH_PUBLIC_NAMES` 时假红
-- `tests/test_forwarders.py` —— TCP / UDP 转发集成测试：本地 echo 服务作目标，验证字节零干扰、三层栈上报、连接计数
+- `tests/test_forwarders.py` —— TCP / UDP 转发集成测试：本地 echo 服务作目标，验证字节零干扰、三层栈上报、连接计数；停止 teardown 限时回归（活跃 / 停滞连接下 stop 秒级完成且端口可重绑，防 Python 3.12+ `Server.wait_closed()` 死锁导致 GUI 停止即卡死）
 - `tests/test_parse_target.py` —— 目标输入解析
 
 > 若你在 shell 里导出了 `SNITAP_ECH_PUBLIC_NAMES`（README 教的做法），

@@ -20,6 +20,7 @@ log = logging.getLogger(__name__)
 
 _CHUNK = 65536
 _CONNECT_TIMEOUT = 10.0
+_STOP_TIMEOUT = 1.0  # teardown 各步限时：对端停滞时 close() 的 flush 可能永不完成
 
 
 class TcpForwarder:
@@ -58,22 +59,33 @@ class TcpForwarder:
         )
 
     async def stop(self) -> None:
-        if self._server is not None:
-            self._server.close()
-            with contextlib.suppress(Exception):
-                await self._server.wait_closed()
-            self._server = None
-
-        for writer in list(self._writers):
-            _close_writer(writer)
-        if self._writers:
-            await asyncio.gather(*(w.wait_closed() for w in list(self._writers)), return_exceptions=True)
-
+        # 顺序关键：先取消 handler 任务再 wait。
+        # Python 3.12+ 的 Server.wait_closed() 会等待全部 handler 退出，若沿用
+        # 旧顺序（先 wait 后 cancel）二者互相等待，只要还有活跃连接 teardown
+        # 就永不结束——GUI 停止即卡死、监听 socket 不释放、重启必报端口占用。
         for task in list(self._tasks):
             task.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
+
+        if self._server is not None:
+            self._server.close()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self._server.wait_closed(), timeout=_STOP_TIMEOUT)
+            self._server = None
+
+        for writer in list(self._writers):
+            _close_writer(writer)
+        if self._writers:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        *(w.wait_closed() for w in list(self._writers)),
+                        return_exceptions=True,
+                    ),
+                    timeout=_STOP_TIMEOUT,
+                )
         self._writers.clear()
         self._active = 0
         self._safe_conn_change()

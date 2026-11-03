@@ -44,6 +44,11 @@ class Worker:
     # ------------------------------------------------------------- 生命周期
 
     def start(self, config: AppConfig) -> None:
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            # 上一轮 stop() 可能尚在收尾（正常毫秒级）：短暂等待确保 running
+            # 判定真实，避免「停止后立刻启动」被静默忽略、界面停在启动中。
+            thread.join(timeout=0.5)
         if self.running:
             return
         self._stats = Stats()

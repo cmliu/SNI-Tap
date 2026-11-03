@@ -10,6 +10,8 @@ import ctypes
 import os
 import queue
 import sys
+import threading
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 from typing import Callable, Optional, Union
@@ -31,6 +33,10 @@ from .widgets import px
 _DRAIN_BATCH = 400
 _NOTICE_MS = 5000
 _THEME_POLL_MS = 2000
+# 「停止中…」的 UI 兜底时限：worker.stop 内部超时上限为 future(3s)+join(3s)，
+# 正常时 StateEvent("stopped") 远早于此到达；超过该时限说明 teardown 已卡死，
+# 直接恢复 idle，不允许界面永远停在停止中。
+_STOP_FALLBACK_S = 7.0
 
 # 等宽字体族优先，中文自动回退微软雅黑
 _FONT_CANDIDATES: tuple[str, ...] = (
@@ -205,6 +211,7 @@ class MainWindow:
         self._notice_seq = 0
         self._notice_job: Optional[str] = None
         self._notice_error = False
+        self._stopping_since: Optional[float] = None
         self._alive = True
         self._placeholder_active = False
 
@@ -711,14 +718,23 @@ class MainWindow:
             self._worker.start(config)
         else:  # running
             self._apply_state("stopping")
-            self._worker.stop(timeout=3.0)
-            self._apply_state("idle")
+            # stop() 严禁在 Tk 主线程同步执行：worker teardown 期间主线程一旦
+            # 被阻塞，窗口会冻结到「未响应」。改为后台线程执行，UI 由
+            # StateEvent("stopped") 驱动回 idle（_drain_events 已处理）。
+            threading.Thread(
+                target=self._worker.stop,
+                kwargs={"timeout": 3.0},
+                name="snitap-stop",
+                daemon=True,
+            ).start()
 
     # ------------------------------------------------------------ 状态与提示
 
     def _apply_state(self, state: str) -> None:
         """状态机：同步按钮文案 / 配色 / 状态灯 / 输入框锁定。"""
         self._state = state
+        # 「停止中…」开始计时，供 _tick 的兜底判断使用；其余状态清零。
+        self._stopping_since = time.monotonic() if state == "stopping" else None
         t = theme.current()
         locking = state in ("starting", "running", "stopping")
 
@@ -833,6 +849,12 @@ class MainWindow:
         if not self._alive:
             return
         self._drain_events()
+        if (
+            self._state == "stopping"
+            and self._stopping_since is not None
+            and time.monotonic() - self._stopping_since >= _STOP_FALLBACK_S
+        ):
+            self._apply_state("idle")  # 兜底：teardown 卡死也不让 UI 停在停止中
         self._timer_job = self.root.after(100, self._tick)
 
     def _drain_events(self) -> None:
@@ -925,7 +947,14 @@ class MainWindow:
                     pass
         self._timer_job = self._theme_job = self._notice_job = None
         if self._worker.running or self._state != "idle":
-            self._worker.stop(timeout=3.0)
+            # 同 _on_toggle：不阻塞主线程；进程随 mainloop 结束退出，
+            # daemon 线程由解释器回收，socket 由操作系统清理。
+            threading.Thread(
+                target=self._worker.stop,
+                kwargs={"timeout": 3.0},
+                name="snitap-stop",
+                daemon=True,
+            ).start()
         self.root.destroy()
 
     def run(self) -> None:
