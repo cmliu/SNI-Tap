@@ -214,13 +214,24 @@ jobs:
           $builtAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss') + ' UTC'
 
           # 通道判据取自顶层 env.IS_STABLE_RELEASE（与 release job 各步骤同源）。
+          # $releaseTag 必须与 release job 实际发布到的 tag 完全一致：
+          #   正式版 → 本次 tag（env.GITHUB_REF_NAME，对应 `tag_name: github.ref_name`）
+          #   nightly → env.NIGHTLY_TAG（对应 `tag_name: env.NIGHTLY_TAG`）
           if ($env:IS_STABLE_RELEASE -eq 'true') {
             $title = "SNI-Tap $env:GITHUB_REF_NAME"
             $kind = "正式发布（tag $env:GITHUB_REF_NAME）"
+            $releaseTag = $env:GITHUB_REF_NAME
           } else {
             $title = 'SNI-Tap nightly build'
             $kind = '滚动预发布（nightly，资产每次覆盖）'
+            $releaseTag = $env:NIGHTLY_TAG
           }
+
+          # 下载直链：owner/repo 取 env.GITHUB_REPOSITORY（fork 后自动指向 fork 仓库，
+          # 不硬编码）；tag 取上面的 $releaseTag。这与 README 里的
+          # releases/latest/download/... 是两条独立入口——前者钉住具体 tag（可用于
+          # 分享/归档），后者永远指向最新正式版。
+          $releaseUrl = "https://github.com/$($env:GITHUB_REPOSITORY)/releases/download/$releaseTag"
 
           $lines = @(
             "## $title"
@@ -231,6 +242,12 @@ jobs:
             "- 构建时间：$builtAt"
             "- 构建环境：windows-latest / Python $pythonVersion / PyInstaller $pyInstallerVersion"
             "- 产物：$env:EXE_NAME（$sizeMb MB）"
+            '- 系统要求：Windows 10 / 11 x64，单文件免安装'
+            ''
+            '### 下载'
+            ''
+            "- [SNI-Tap.exe]($releaseUrl/SNI-Tap.exe)"
+            "- [SNI-Tap.exe.sha256]($releaseUrl/SNI-Tap.exe.sha256)"
             ''
             '### 校验'
             ''

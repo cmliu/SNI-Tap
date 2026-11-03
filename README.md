@@ -4,6 +4,13 @@
 同时在转发过程中嗅探 TLS/QUIC 握手，实时显示每次访问的
 **应用层 / 传输层 / 安全层** 三层协议栈，并按四元组聚合统计。
 
+[![build-release](https://github.com/cmliu/SNI-Tap/actions/workflows/build-release.yml/badge.svg)](https://github.com/cmliu/SNI-Tap/actions/workflows/build-release.yml)
+
+**下载**（Windows 10 / 11 x64，单文件免安装，无需 Python）：
+[最新正式版](https://github.com/cmliu/SNI-Tap/releases/latest/download/SNI-Tap.exe) ·
+[滚动构建 nightly](https://github.com/cmliu/SNI-Tap/releases/tag/nightly) ·
+[SHA256 校验文件](https://github.com/cmliu/SNI-Tap/releases/latest/download/SNI-Tap.exe.sha256)
+
 ## 功能
 
 | 功能 | 说明 |
