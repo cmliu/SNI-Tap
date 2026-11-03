@@ -1,0 +1,373 @@
+# SNI-Tap CI：代码变动 → 单元测试 → PyInstaller 打包 Windows 单文件 exe → 发布 GitHub Release
+#
+# 双发布通道（判据见顶层 env.IS_STABLE_RELEASE，4 个消费点全部同源）：
+#   * push main / workflow_dispatch → 滚动预发布（固定 tag `nightly`，prerelease: true），
+#     每次覆盖同名资产，保证 releases/download/nightly/SNI-Tap.exe 这个链接长期有效。
+#   * push tag v*                   → 正式 Release（用该 tag，非 prerelease，标记 latest）。
+#     特例：直接在 `nightly` tag 上 dispatch 仍走滚动通道——否则会把预发布提升成正式版
+#     并抢走 Latest。注意：在**其他** tag（含历史版本）上 dispatch 会按正式通道重发该 tag，
+#     并把 Latest 挪过去（判据只排除 nightly，不校验 tag 与 __version__ 是否一致）；
+#     需要重发历史版本时才这样做。
+#
+# 仓库前置条件（缺一不可，否则 nightly 通道必然失败）：
+#   * 不要启用 Release immutability（不可变 Release）。启用后已发布 Release 的资产不能
+#     新增/替换/删除、其 tag 也不能移动/删除，本工作流「移动 nightly tag + 覆盖同名资产」
+#     会双双被拒。
+#   * 不要给 refs/tags/nightly 配 tag protection rule / ruleset，同样会拒绝 tag 强推。
+#   依据：GitHub docs「Managing releases in a repository」关于 immutable releases 的限制。
+#
+# 幂等性依据（softprops/action-gh-release@v3，2026-11 查证）：
+#   README「Uploading release assets」原文：
+#     "If a tag already has a GitHub release, the existing release will be updated
+#      with the release assets."
+#   inputs 表原文（overwrite_files）：
+#     "Indicator of whether files should be overwritten when they already exist.
+#      Defaults to true"
+#   ⇒ v3 在目标 Release 已存在且资产同名时会就地更新 Release 并覆盖资产，
+#     无需 `gh release upload --clobber`，也无需先删除旧资产。
+#   版本线：README 原文 "v2.6.2 is the final v2 release and is no longer maintained or
+#     supported. It uses the Node 20 runtime deprecated by GitHub Actions. Upgrade to v3,
+#     which runs on Node 24." ⇒ 固定 v3。
+#
+# 约束：本文件只做 CI，不改动源码 / 测试 / snitap.spec / requirements.txt。
+
+name: build-release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+    # 纯文档变更不触发打包。
+    # 注意：GitHub 文档明确「Path filters are not evaluated for pushes of tags」，
+    # 所以打 tag 时不会因为这里的 paths-ignore 被跳过。
+    # （不再列 design/**：.gitignore 已忽略该目录，它不会出现在 push 里，是死条目。）
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.gitignore'
+  # 手动补跑：默认走滚动 nightly 通道（ref_type 为 branch）；
+  # 在 tag 上 dispatch 时按 env.IS_STABLE_RELEASE 决定通道，见下方单一判据。
+  workflow_dispatch:
+
+# 默认最小权限：test / build 只读（artifact 走 ACTIONS_RUNTIME_TOKEN，与 contents 无关）。
+# 发布时需要的 contents: write 只在 release job 上单独声明。
+permissions:
+  contents: read
+
+# 同一 workflow + 同一 ref 串行化，避免两个并发构建互相覆盖同名资产。
+# 但正式版发布绝不取消：中断在 action-gh-release 上传中途会留下
+# 「exe 已换、sha256 还是上一版」的错配，恰好毁掉本工作流主打的校验能力。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  PYTHON_VERSION: '3.13'
+  EXE_NAME: SNI-Tap.exe
+  EXE_PATH: dist/SNI-Tap.exe
+  ARTIFACT_NAME: snitap-exe
+  NIGHTLY_TAG: nightly
+  # 发布通道的唯一判据：只有「打的是 tag」且「该 tag 不是滚动 nightly tag」才算稳定版。
+  # 下面 4 个消费点全部读它，不允许各自再写一遍表达式：
+  #   1) build   / Compose release notes        → Release 正文的标题与文案
+  #   2) release / Move rolling nightly tag
+  #   3) release / Publish rolling nightly prerelease
+  #   4) release / Publish tagged release
+  # 注意：workflow 级 env 里拿不到 env 上下文，这里的 'nightly' 与上面的
+  # NIGHTLY_TAG 手工保持一致；step 级 if: 可以读 env.IS_STABLE_RELEASE。
+  IS_STABLE_RELEASE: ${{ github.ref_type == 'tag' && github.ref_name != 'nightly' && 'true' || 'false' }}
+  # 体积门禁：MIN_EXE_MB 是硬门禁（低于即 fail）；EXPECTED_MIN_MB 只打 warning。
+  # 实测带 cryptography/OpenSSL 的产物约 14.88 MB；掉到 9 MB 量级通常意味着
+  # cryptography 没被打进包，12 MB 是几乎零误伤的告警线。
+  MIN_EXE_MB: '1'
+  EXPECTED_MIN_MB: '12'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) 质量门禁：跑单元测试，失败则不打包、不发布
+  # ---------------------------------------------------------------------------
+  test:
+    name: Unit tests
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install runtime dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Verify interpreter has tkinter
+        shell: pwsh
+        run: |
+          # GUI 依赖标准库 tkinter；windows-latest 的官方 CPython 自带，
+          # 这里显式断言一次，避免换成精简发行版后静默失败。
+          $ErrorActionPreference = 'Stop'
+          python -c "import sys, tkinter; print('python', sys.version.split()[0]); print('tkinter', tkinter.TkVersion)"
+
+      - name: Run unit tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m unittest discover -s tests -v
+
+  # ---------------------------------------------------------------------------
+  # 2) 打包：PyInstaller 单文件 exe + 体积校验 + sha256 + 构建信息
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build Windows exe
+    needs: test
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          # requirements.txt 只含运行时依赖；PyInstaller 属于构建工具，单独安装。
+          $ErrorActionPreference = 'Stop'
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install "pyinstaller>=6.0"
+
+      - name: Build single-file exe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pyinstaller snitap.spec --noconfirm
+
+      - name: Verify exe exists and has plausible size
+        shell: pwsh
+        run: |
+          # 防止「PyInstaller 静默没产出 exe 但 exit 0」被当成成功发布出去。
+          $ErrorActionPreference = 'Stop'
+          $exe = $env:EXE_PATH
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+            throw "构建产物缺失：$exe"
+          }
+          $sizeBytes = (Get-Item -LiteralPath $exe).Length
+          $sizeMb = [math]::Round($sizeBytes / 1MB, 2)
+          Write-Host "产物：$exe  体积：$sizeMb MB"
+          if ($sizeBytes -lt (1MB * [double]$env:MIN_EXE_MB)) {
+            throw "体积异常：$sizeMb MB < $env:MIN_EXE_MB MB，拒绝发布"
+          }
+          if ($sizeBytes -lt (1MB * [double]$env:EXPECTED_MIN_MB)) {
+            # 非致命：README 记录预期 14~16 MB（含 Tcl/Tk + OpenSSL）；
+            # 若明显偏小，通常是 cryptography / OpenSSL 没被打进包（QUIC 解密会退化为 "-"）。
+            Write-Host "::warning::体积 $sizeMb MB 低于预期下限 $env:EXPECTED_MIN_MB MB，请确认 cryptography/OpenSSL 已打包"
+          }
+
+      - name: Generate SHA256 checksum
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $env:EXE_PATH).Hash.ToLowerInvariant()
+          # 与 sha256sum 的输出格式一致（hash + 两个空格 + 文件名）。
+          # 显式用 .NET 写 LF 行尾 + ASCII：Set-Content 会写 CRLF，导致
+          # Git Bash 里 `sha256sum -c SNI-Tap.exe.sha256` 报格式错误。
+          $line = "$hash  $env:EXE_NAME"
+          $checksumPath = Join-Path $env:GITHUB_WORKSPACE ($env:EXE_PATH + '.sha256')
+          [System.IO.File]::WriteAllText($checksumPath, $line + "`n", (New-Object System.Text.ASCIIEncoding))
+          Write-Host "sha256: $hash"
+          Write-Host $line
+
+      - name: Compose release notes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+          # 版本号直接从源码正则提取（不 import snitap，避免副作用与路径问题）。
+          $versionMatch = Select-String -LiteralPath 'src/snitap/__init__.py' -Pattern '__version__\s*=\s*"([^"]+)"'
+          if (-not $versionMatch -or $versionMatch.Matches.Count -eq 0) {
+            throw '无法从 src/snitap/__init__.py 解析 __version__'
+          }
+          $version = $versionMatch.Matches[0].Groups[1].Value
+
+          $pythonVersion = (python -c "import sys; print('.'.join(str(v) for v in sys.version_info[:3]))").Trim()
+          $pyInstallerVersion = (python -c "import PyInstaller; print(PyInstaller.__version__)").Trim()
+          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+          $sizeMb = [math]::Round((Get-Item -LiteralPath $env:EXE_PATH).Length / 1MB, 2)
+          $sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $env:EXE_PATH).Hash.ToLowerInvariant()
+          $builtAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss') + ' UTC'
+
+          # 通道判据取自顶层 env.IS_STABLE_RELEASE（与 release job 各步骤同源）。
+          if ($env:IS_STABLE_RELEASE -eq 'true') {
+            $title = "SNI-Tap $env:GITHUB_REF_NAME"
+            $kind = "正式发布（tag $env:GITHUB_REF_NAME）"
+          } else {
+            $title = 'SNI-Tap nightly build'
+            $kind = '滚动预发布（nightly，资产每次覆盖）'
+          }
+
+          $lines = @(
+            "## $title"
+            ''
+            "- 构建类型：$kind"
+            "- 版本号（src/snitap/__init__.py）：$version"
+            "- 提交：$shortSha"
+            "- 构建时间：$builtAt"
+            "- 构建环境：windows-latest / Python $pythonVersion / PyInstaller $pyInstallerVersion"
+            "- 产物：$env:EXE_NAME（$sizeMb MB）"
+            ''
+            '### 校验'
+            ''
+            '```'
+            "$sha256  $env:EXE_NAME"
+            '```'
+            ''
+            'PowerShell 校验：`(Get-FileHash .\SNI-Tap.exe -Algorithm SHA256).Hash.ToLower()` 应等于上方哈希。'
+            ''
+            'Git Bash / Linux 校验：`sha256sum -c SNI-Tap.exe.sha256`（本 Release 同时提供该校验文件）。'
+            ''
+            '使用方法见仓库 README「快速开始」：本程序是本地 TCP/UDP 转发 + 三层协议嗅探 GUI，'
+            '无控制台窗口，双击运行即可。'
+          )
+          if ($env:IS_STABLE_RELEASE -ne 'true') {
+            $lines += ''
+            $lines += ("> 这是滚动预发布：每次 main 分支构建都会覆盖 " + $env:EXE_NAME + "，请以本文列出的提交号与哈希为准。")
+          }
+
+          $notes = ($lines -join "`n") + "`n"
+          # Release body 走文件 + body_path 传入：job 之间的 outputs 无法安全承载多行文本，
+          # 写成文件再 upload-artifact 传递是最可靠的做法。
+          $notesPath = Join-Path $env:GITHUB_WORKSPACE 'dist/release-notes.md'
+          [System.IO.File]::WriteAllText($notesPath, $notes, $utf8NoBom)
+
+          # 同时写进 job 摘要，方便在 Actions 运行页直接看构建信息。
+          [System.IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, $notes, $utf8NoBom)
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: |
+            dist/SNI-Tap.exe
+            dist/SNI-Tap.exe.sha256
+            dist/release-notes.md
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # 3) 发布：nightly 滚动预发布 / tag 正式 Release
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish release
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 10
+    # 只有本 job 需要写权限：发 Release / 移动 nightly tag。
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: dist
+
+      - name: Verify downloaded assets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($file in @($env:EXE_PATH, ($env:EXE_PATH + '.sha256'), 'dist/release-notes.md')) {
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+              throw "发布资产缺失：$file"
+            }
+            Write-Host "OK  $file  $((Get-Item -LiteralPath $file).Length) bytes"
+          }
+          $sizeBytes = (Get-Item -LiteralPath $env:EXE_PATH).Length
+          # 阈值与 build 侧同源（顶层 env.MIN_EXE_MB），不要在这里写死常量。
+          if ($sizeBytes -lt (1MB * [double]$env:MIN_EXE_MB)) {
+            throw "发布资产体积异常：$sizeBytes bytes < $env:MIN_EXE_MB MB"
+          }
+          # 校验 artifact 下载没有损坏：重新计算哈希，与构建阶段写入的校验文件比对。
+          $checksumFile = $env:EXE_PATH + '.sha256'
+          $checksumText = (Get-Content -LiteralPath $checksumFile -Raw)
+          if ([string]::IsNullOrWhiteSpace($checksumText)) {
+            # 0 字节 / 全空白时先给出可读的中文错误，避免暴露原生
+            # 「不能对 Null 值表达式调用方法。」这种无从下手的报错。
+            throw "校验文件为空：$checksumFile"
+          }
+          $expected = ($checksumText.Trim() -split '\s+')[0]
+          if ([string]::IsNullOrWhiteSpace($expected)) {
+            throw "校验文件内容不合法（取不到哈希）：$checksumFile"
+          }
+          $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $env:EXE_PATH).Hash.ToLowerInvariant()
+          if ($expected -ne $actual) {
+            throw "校验和不匹配：校验文件 $expected / 实际 $actual"
+          }
+          Write-Host "sha256 一致：$actual"
+
+      - name: Move rolling nightly tag
+        # 判据来自顶层 env.IS_STABLE_RELEASE（唯一来源）。非稳定版（main / dispatch）才执行：
+        # 让 `nightly` tag 始终指向本次构建的提交（Release 的 tag 一旦创建就不会自己移动）。
+        # 推的是 `nightly` 而非 `v*`，且用 GITHUB_TOKEN 产生的 push 事件本身不会触发新
+        # workflow，不存在递归。
+        if: env.IS_STABLE_RELEASE != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git tag -f $env:NIGHTLY_TAG $env:GITHUB_SHA
+          git push --force origin "refs/tags/$env:NIGHTLY_TAG"
+
+      - name: Publish rolling nightly prerelease
+        if: env.IS_STABLE_RELEASE != 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.NIGHTLY_TAG }}
+          target_commitish: ${{ github.sha }}
+          name: SNI-Tap nightly build
+          body_path: dist/release-notes.md
+          prerelease: true
+          # prerelease 不能标记为 latest；显式写 'false' 是为了不动已有的正式 Release。
+          make_latest: 'false'
+          # 同名资产就地覆盖（v3 默认即为 true，这里显式声明以免默认值变化）。
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/SNI-Tap.exe
+            dist/SNI-Tap.exe.sha256
+
+      - name: Publish tagged release
+        if: env.IS_STABLE_RELEASE == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: SNI-Tap ${{ github.ref_name }}
+          body_path: dist/release-notes.md
+          draft: false
+          prerelease: false
+          make_latest: 'true'
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/SNI-Tap.exe
+            dist/SNI-Tap.exe.sha256

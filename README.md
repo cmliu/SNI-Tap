@@ -109,6 +109,22 @@ pyinstaller snitap.spec
 （QUIC Initial 解密依赖，`snitap.spec` 已解除 `ssl/_ssl/_hashlib` 排除，
 并在 `hiddenimports` 显式声明 cryptography 的懒加载子模块）。
 
+## 自动构建与发布（GitHub Actions）
+
+`.github/workflows/build-release.yml` 在推送时自动跑单元测试 → PyInstaller 打包 → 发布 exe：
+
+| 触发 | 发布到 | 下载地址 |
+|---|---|---|
+| push `main`（跳过纯文档变更）、手动 Run workflow | 滚动预发布，固定 tag `nightly`，每次覆盖资产 | `releases/download/nightly/SNI-Tap.exe` |
+| push tag `v*` | 正式 Release，用该 tag，标记 latest | `releases/download/<tag>/SNI-Tap.exe` |
+
+资产名固定为 `SNI-Tap.exe`（无版本后缀，链接长期有效）与 `SNI-Tap.exe.sha256`
+（PowerShell 用 `Get-FileHash -Algorithm SHA256`，Git Bash 用 `sha256sum -c`）。Release 正文含版本号、
+提交号、构建时间与 Python / PyInstaller 版本；单元测试不通过则不打包、不发布。
+
+> 前置条件：仓库**不要**启用 Release immutability，也**不要**给 `refs/tags/nightly` 配 tag
+> 保护规则——nightly 通道依赖「移动同名 tag + 覆盖同名资产」，两者都会让 nightly 必然失败。
+
 ## 目录结构
 
 ```
