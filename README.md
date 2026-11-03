@@ -139,7 +139,6 @@ SNI-Tap/
 ├── main.py                     # 便捷入口：python main.py
 ├── requirements.txt            # cryptography>=44.0（QUIC 解密；缺失自动降级）
 ├── snitap.spec                 # PyInstaller 打包配置
-├── docs/ARCHITECTURE.md        # 架构设计文档（含决策记录）
 ├── tests/
 │   ├── test_protocol.py
 │   ├── test_tls_sniffer.py
