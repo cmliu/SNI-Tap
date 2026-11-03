@@ -1,4 +1,4 @@
-"""主窗口：终端风布局 + 双主题（跟随系统亮暗）+ 命令配置行 + 左右分栏。
+"""主窗口：终端风布局 + 双主题（跟随系统亮暗）+ 命令配置行 + 上下分栏。
 
 窗口只做展示：所有网络逻辑在 ``Worker`` 线程，GUI 通过 100ms 轮询
 ``worker.events`` 队列消费事件，绝不跨线程直接操作控件。
@@ -46,11 +46,13 @@ _DWMWA_CAPTION_COLOR = 35
 _DWMWA_USE_IMMERSIVE_DARK_MODE = 20
 
 # 布局令牌（逻辑像素，运行时按 DPI 缩放）
-WINDOW_W = 760
+WINDOW_W = 560
 WINDOW_H = 560
 MARGIN_L, MARGIN_T, MARGIN_R, MARGIN_B = 14, 12, 14, 10
 ROW_GAP = 8
-PANEL_MIN_W = 280
+PANEL_MIN_H = 104          # 统计面板最小高：表头 31 + 1 条两行条目 40 + footer 21 + padding 12（offscreen 实测 103，+1 余量）
+STATS_PANE_INIT_H = 144    # 统计面板默认高：表头 31 + 约 2 条两行条目 80 + footer 21 + padding 12（实测 143，+1 余量）
+LOG_PANE_INIT_H = 315      # 日志面板默认高：与统计面板 144 + sash 8 合计 ≈ 主区实高 465
 LISTEN_EDIT_W = 80
 TOGGLE_MIN_W = 112
 
@@ -375,11 +377,11 @@ class MainWindow:
         self.status_bar.pack(fill="x")
 
     def _build_config_row(self, master: tk.Misc) -> tk.Frame:
-        """行1：listen 端口 → 目标 host / 清除 → 启停按钮。"""
+        """行1：监听端口 → 转发到 目标 host / 清除 → 启停按钮。"""
         row = tk.Frame(master)
         self._paint(row, bg="bg")
 
-        self.lbl_listen = self._label(row, "listen", self.fonts.ui, "green", "bg")
+        self.lbl_listen = self._label(row, "监听端口", self.fonts.ui, "green", "bg")
         self.lbl_listen.pack(side="left", padx=(0, px(8)))
 
         # 端口输入框：固定 80px 宽
@@ -393,7 +395,10 @@ class MainWindow:
         self._bind_field_focus(self.listen_field, self.edit_listen)
 
         self.lbl_arrow = self._label(row, "\u2192", self.fonts.ui, "dim", "bg")
-        self.lbl_arrow.pack(side="left", padx=(px(8), px(8)))
+        self.lbl_arrow.pack(side="left", padx=(px(8), px(2)))
+
+        self.lbl_forward = self._label(row, "转发到", self.fonts.ui, "green", "bg")
+        self.lbl_forward.pack(side="left", padx=(px(2), px(8)))
 
         # 目标输入框：随窗口拉伸 + 右侧清除按钮
         self.target_field = widgets.make_field(row)
@@ -518,10 +523,10 @@ class MainWindow:
         return row
 
     def _build_main_area(self, master: tk.Misc) -> tk.PanedWindow:
-        """行3：左右 5:5 可拖动分栏，两栏最小宽 280。"""
+        """行3：上下垂直分栏（可拖动），上=统计表（约 40%），下=滚动日志（约 60%）。"""
         split = tk.PanedWindow(
             master,
-            orient="horizontal",
+            orient="vertical",
             bg=theme.current().bg,
             sashwidth=px(ROW_GAP),
             sashrelief="flat",
@@ -533,19 +538,18 @@ class MainWindow:
         )
         self._paint(split, bg="bg")
 
-        log_pane = self._build_log_pane(split)
-        stats_pane = self._build_stats_pane(split)
+        stats_pane = self._build_stats_pane(split)  # 中部：统计表
+        log_pane = self._build_log_pane(split)      # 底部：滚动日志
 
-        half = px((WINDOW_W - MARGIN_L - MARGIN_R - ROW_GAP) // 2)
-        split.add(log_pane, minsize=px(PANEL_MIN_W), width=half, stretch="always")
-        split.add(stats_pane, minsize=px(PANEL_MIN_W), width=half, stretch="always")
+        split.add(stats_pane, minsize=px(PANEL_MIN_H), height=px(STATS_PANE_INIT_H), stretch="always")
+        split.add(log_pane, minsize=px(PANEL_MIN_H), height=px(LOG_PANE_INIT_H), stretch="always")
 
         self.log_pane = log_pane
         self.stats_pane = stats_pane
         return split
 
     def _build_log_pane(self, master: tk.Misc) -> tk.Frame:
-        """左面板：面板头（标题 / 上限提示 / 清除）+ 分隔线 + 日志。"""
+        """底部面板：面板头（标题 / 上限提示 / 清除）+ 分隔线 + 滚动日志。"""
         pane = widgets.make_pane(master)
         self._paint(pane, bg="pane", highlightbackground="border")
 
@@ -605,7 +609,7 @@ class MainWindow:
         return pane
 
     def _build_stats_pane(self, master: tk.Misc) -> tk.Frame:
-        """右面板：无面板头，直接三列表格 + footer（对齐原实现）。"""
+        """中部面板：无面板头，直接两行式统计表 + footer（对齐原实现）。"""
         pane = widgets.make_pane(master)
         self._paint(pane, bg="pane", highlightbackground="border")
         body = tk.Frame(pane)

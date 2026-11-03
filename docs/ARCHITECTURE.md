@@ -335,6 +335,9 @@ UDP 数据报 → 长包头判型（long+fixed 且类型 00）
 
 ### 10.5 GUI 变化
 
+- 主区改为**上下垂直分栏**（可拖动）：统计表面板在中部（初始约 40%）、
+  滚动日志面板在底部（初始约 60%）；原左右分栏的最小宽约束（280）改为
+  最小高约束（140），避免垂直拖动被 minimumSizeHint 顶住；
 - 日志行五段式：`ts  domain  app  transport  security`（两空格分隔，不做列对齐填充）；
   tag 映射 `ts/transport→dim`、`domain→cyan`、`app→muted`、`security→green`；
   整块 insert 一次 + **4 条批量 `tag_add`**（dim 合并两个区间），禁止逐行打 tag；
