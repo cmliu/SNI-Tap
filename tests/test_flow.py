@@ -1,7 +1,9 @@
 """流聚合器（TcpFlow / QuicFlow）单元测试。
 
 覆盖：聚合与合并规则、provisional 语义、幂等性（_finish 连调两次只回调
-一次）、非 TLS / 非 QUIC 零上报、backstop 兜底与无 loop 场景。
+一次）、非 TLS / 非 QUIC 零上报、backstop 兜底与无 loop 场景、
+ECH 双字段语义（``ech_ext`` 只取客户端方向的原始观测，``ech`` 还要求外层 SNI
+命中 ECH 掩护域名）。
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
+from ech_env_isolation import ConfigIsolatedCase
 from snitap.flow import QuicFlow, TcpFlow
 from snitap.protocol import UNKNOWN, ProtocolStack
 from test_tls_sniffer import build_client_hello, build_server_hello
@@ -97,6 +100,97 @@ class TcpFlowTest(unittest.TestCase):
         up(None)  # type: ignore[arg-type]  # 非法输入触发内部异常路径
         self.assertEqual(self.stacks, [])
         self.assertFalse(flow._done)
+
+
+class TcpFlowEchTest(ConfigIsolatedCase):
+    """ECH 合并规则：``ech_ext`` 取客户端方向原始观测，``ech`` 还要 SNI 命中掩护域名。
+
+    语义收紧（RFC 9849 §6.2 / §10.10.4）：携带 ``0xFE0D`` 扩展不等于 ECH 生效，
+    因为客户端没有可用 ECHConfig 时会发送 GREASE ECH；真 ECH 的外层 SNI 必然是
+    ``public_name`` 掩护域名，GREASE ECH 的外层 SNI 则是真实域名。
+
+    继承 :class:`ech_env_isolation.ConfigIsolatedCase`：用例断言 ``cloudflare-ech.com``
+    命中默认名单，开发机导出 ``SNITAP_ECH_PUBLIC_NAMES`` 时不会假红。
+    """
+
+    PUBLIC_NAME = "cloudflare-ech.com"
+    REAL_DOMAIN = "test.cmliussss.dpdns.org"
+
+    def setUp(self) -> None:
+        super().setUp()   # 先落默认名单基线（ConfigIsolatedCase）
+        self.stacks: list[ProtocolStack] = []
+
+    def make_flow(self) -> TcpFlow:
+        return TcpFlow(self.stacks.append)
+
+    def test_public_name_sni_marks_ech_confirmed(self) -> None:
+        flow = self.make_flow()
+        up = flow.sink("up")
+        assert up is not None
+        up(build_client_hello(self.PUBLIC_NAME, alpn=b"h2", ech=b"\x01\x02\x03"))
+        flow.close()
+        self.assertEqual(len(self.stacks), 1)
+        stack = self.stacks[0]
+        self.assertTrue(stack.ech_ext)              # 扩展存在
+        self.assertTrue(stack.ech)                  # 且 SNI 是掩护域名 → 确证
+        self.assertEqual(stack.security_label, "TLS1.3/A128GCM ECH")
+        self.assertIn(" ECH", stack.key[3])
+        self.assertTrue(stack.provisional)          # 只有客户端方向
+        self.assertEqual(stack.sni, self.PUBLIC_NAME)  # 外层 SNI 仍可见
+
+    def test_real_domain_sni_is_grease_not_marked(self) -> None:
+        """用户实际报的场景：关闭 ECH 的域名仍携带扩展（GREASE），不得标记。"""
+        flow = self.make_flow()
+        up = flow.sink("up")
+        assert up is not None
+        up(build_client_hello(self.REAL_DOMAIN, alpn=b"h2", ech=b"\x01\x02\x03"))
+        flow.close()
+        self.assertEqual(len(self.stacks), 1)
+        stack = self.stacks[0]
+        self.assertTrue(stack.ech_ext)              # 扩展确实存在
+        self.assertFalse(stack.ech)                 # 但不是确证生效
+        self.assertEqual(stack.security_label, "TLS1.3/A128GCM")
+        self.assertNotIn(" ECH", stack.key[3])
+        self.assertEqual(stack.ech_mark, "")
+
+    def test_no_ech_keeps_plain_stack(self) -> None:
+        flow = self.make_flow()
+        up = flow.sink("up")
+        assert up is not None
+        up(build_client_hello("plain.example", alpn=b"h2"))
+        flow.close()
+        stack = self.stacks[0]
+        self.assertFalse(stack.ech)
+        self.assertFalse(stack.ech_ext)
+        self.assertEqual(stack.security_label, "TLS1.3/A128GCM")
+
+    def test_ech_with_both_directions_still_true(self) -> None:
+        flow = self.make_flow()
+        up = flow.sink("up")
+        down = flow.sink("down")
+        assert up is not None and down is not None
+        up(build_client_hello(self.PUBLIC_NAME, alpn=b"h2", ech=b"\xaa" * 8))
+        down(build_server_hello(alpn=b"h3", cipher=0x1302))
+        self.assertEqual(len(self.stacks), 1)
+        stack = self.stacks[0]
+        self.assertTrue(stack.ech)                  # 协商值来自服务端，ECH 仍来自客户端
+        self.assertTrue(stack.ech_ext)
+        self.assertFalse(stack.provisional)
+        self.assertEqual(stack.app, "h3")
+        self.assertEqual(stack.security_label, "TLS1.3/A256GCM ECH")
+
+    def test_server_side_ech_extension_alone_does_not_mark(self) -> None:
+        # 服务端方向不参与 ECH 判定：只有 ServerHello 带扩展时仍不标记
+        flow = self.make_flow()
+        up = flow.sink("up")
+        down = flow.sink("down")
+        assert up is not None and down is not None
+        up(build_client_hello(self.PUBLIC_NAME, alpn=b"h2"))
+        down(build_server_hello(alpn=b"h3", cipher=0x1302))
+        self.assertEqual(len(self.stacks), 1)
+        stack = self.stacks[0]
+        self.assertFalse(stack.ech_ext)
+        self.assertFalse(stack.ech)
 
 
 class QuicFlowTest(unittest.TestCase):

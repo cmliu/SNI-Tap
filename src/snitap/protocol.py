@@ -6,6 +6,8 @@
 核心约定：
 - 统计键 = ``(domain, app, transport_label, security)`` 有序四元组，
   ``provisional`` 与各 ``*_source`` 不进键——统计表是聚合真值，日志是单次观测；
+  安全层可能带 `` ECH`` 后缀（见 :attr:`ProtocolStack.security_label`），
+  ECH 与非 ECH 的同一组合因此天然分成两行统计；
 - 名称表必须单射（不同 ID 不得映射到同一字符串），否则「任一层不同即
   独立成行」的语义会被短名合并破坏；
 - 三层顺序固定：应用层 → 传输层 → 安全层，日志、摘要、表头、文档全部同序。
@@ -22,6 +24,7 @@ UNKNOWN = "-"
 CAPTION_SEP = " · "
 LOG_SEP = "  "  # 两个空格
 PROVISIONAL_MARK = "?"
+ECH_MARK = "ECH"  # 安全层后缀：确证客户端发起真 ECH（扩展存在 ∧ SNI 是掩护域名）
 
 
 class LayerSource(str, Enum):
@@ -133,6 +136,22 @@ class ProtocolStack:
     alpn: str = UNKNOWN
     alpn_source: LayerSource = LayerSource.NONE
     provisional: bool = False
+    # **确证生效**：即 ``ech_ext`` 为真 **且** 外层 SNI 命中 ECH 掩护域名
+    # （ECHConfig 的 ``public_name``，见 ``config.ECH_PUBLIC_NAMES``）。
+    # 只有该字段为真才允许在日志 / 统计摘要里出现 ``ECH`` 标记：
+    # 真 ECH 的外层 SNI 必然是掩护域名，而 GREASE ECH 的外层 SNI 是真实域名，
+    # 故「扩展存在 ∧ SNI 是掩护域名」是单连接上唯一可用的区分依据。
+    # 语义边界：即便确证客户端发起了真 ECH，服务端是否接受在明文里仍不可判定
+    # （accept_confirmation 埋在 ServerHello.random[24..32]，推导依赖不可见的
+    # ClientHelloInner.random），因此不得表述为「服务端已接受」。
+    ech: bool = False
+    # **原始观测**：外层 ClientHelloOuter 明文携带 ``0xFE0D``
+    # encrypted_client_hello 扩展，**可能是 GREASE ECH**。
+    # RFC 9849 §6.2 规定没有可用 ECHConfig 的客户端 SHOULD 发送一个假的
+    # encrypted_client_hello 扩展（随机 payload 伪装成 L+C），§10.10.4 又明确
+    # 真 ECH 与 GREASE ECH 对被动观察者设计上不可区分——因此本字段单独存在
+    # 不构成「ECH 生效」，只用于底栏的疑似 GREASE 计数（``ech? X``）。
+    ech_ext: bool = False
 
     @property
     def domain(self) -> str:
@@ -157,9 +176,24 @@ class ProtocolStack:
         return f"{self.tls_version}/{self.cipher}"
 
     @property
+    def ech_mark(self) -> str:
+        """ECH 标记：确证生效（``ech`` 为真）时为 ``"ECH"``，否则空串。"""
+        return ECH_MARK if self.ech else ""
+
+    @property
+    def security_label(self) -> str:
+        """安全层展示名（带可选的 `` ECH`` 后缀），统计键与日志用它。"""
+        mark = self.ech_mark
+        return f"{self.security} {mark}" if mark else self.security
+
+    @property
     def key(self) -> tuple[str, str, str, str]:
-        """统计键：(域名, 应用层, 传输层, 安全层)；provisional/source 不进键。"""
-        return (self.domain, self.app, self.transport_label, self.security)
+        """统计键：(域名, 应用层, 传输层, 安全层)；provisional/source 不进键。
+
+        安全层用 :attr:`security_label`，故带 `` ECH`` 后缀的行与非 ECH 行
+        天然是不同键、独立统计。
+        """
+        return (self.domain, self.app, self.transport_label, self.security_label)
 
     @property
     def has_content(self) -> bool:
@@ -171,8 +205,8 @@ class ProtocolStack:
         )
 
     def caption(self) -> str:
-        """统计摘要文案：``app · transport · security``。"""
-        return _caption(self.app, self.transport_label, self.security)
+        """统计摘要文案：``app · transport · security``（security 含 ECH 后缀）。"""
+        return _caption(self.app, self.transport_label, self.security_label)
 
 
 @dataclass(frozen=True)
@@ -182,13 +216,18 @@ class StackRow:
     domain: str
     app: str
     transport: str  # 已规格化的 transport_label
-    security: str
+    security: str   # 可能是带 `` ECH`` 后缀的 security_label
     count: int
 
     @property
     def key(self) -> tuple[str, str, str, str]:
         """统计键，与 ProtocolStack.key 同构。"""
         return (self.domain, self.app, self.transport, self.security)
+
+    @property
+    def has_ech(self) -> bool:
+        """该行是否带 ECH 标记（供统计表给 ECH 上色）。"""
+        return self.security.endswith(f" {ECH_MARK}")
 
     def caption(self) -> str:
         """统计摘要文案，与同键 ProtocolStack 的 caption 完全一致。"""
@@ -201,6 +240,6 @@ class StackRow:
             domain=stack.domain,
             app=stack.app,
             transport=stack.transport_label,
-            security=stack.security,
+            security=stack.security_label,
             count=count,
         )

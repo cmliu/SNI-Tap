@@ -158,6 +158,8 @@ class Worker:
                     udp_sessions=self._stats.udp_sessions,
                     total_hits=self._stats.total_hits,
                     distinct=self._stats.distinct,
+                    ech_hits=self._stats.ech_hits,
+                    ech_ext_hits=self._stats.ech_ext_hits,
                     truncated=truncated,
                 )
             )

@@ -857,6 +857,7 @@ class MainWindow:
                         transport=stack.transport_label,
                         security=stack.security,
                         provisional=stack.provisional,
+                        ech=stack.ech,
                     )
                 )
             elif isinstance(event, TcpingEvent):
@@ -900,6 +901,13 @@ class MainWindow:
         self._net = (event.tcp_conns, event.udp_sessions, event.total_hits)
         self._render_net()
         footer = f"total {event.total_hits} · {event.distinct} 组"
+        if event.ech_hits > 0:
+            footer += f" · ech {event.ech_hits}"
+        # 疑似 GREASE：携带 0xFE0D 扩展但外层 SNI 不是 ECH 掩护域名。
+        # 顺序固定：total → 组数 → ech → ech? → 截断说明。
+        suspected_grease = event.ech_ext_hits - event.ech_hits
+        if suspected_grease > 0:
+            footer += f" · ech? {suspected_grease}"
         if event.truncated:
             footer += f" · 仅显示前 {Stats.MAX_ROWS} 组"
         self.lbl_total.configure(text=footer)

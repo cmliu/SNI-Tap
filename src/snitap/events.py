@@ -53,6 +53,17 @@ class StatsEvent:
     total_hits: int
     distinct: int
     truncated: bool = False
+    # 字段尾序固定（位置参数索引从 0 数起）：
+    #   [..., truncated(7), ech_hits(8), ech_ext_hits(9)]
+    # 新字段**只能追加在末尾**：既有 7 参位置构造的第 7 位是 truncated，插到它前面
+    # 会让 truncated 被静默顶掉、回落到 False。
+    # 确证生效（ECH 标记）的累计次数，第 8 个位置参数；对应统计表里带
+    # `` ECH`` 后缀的行。
+    ech_hits: int = 0
+    # 携带 0xFE0D 扩展的累计次数（含疑似 GREASE ECH），第 9 个位置参数。
+    # 追加在 ech_hits 之后：否则会顶掉 ech_hits / truncated。
+    # ``ech_ext_hits > ech_hits`` 时底栏额外显示 ``ech? X``（X 为两者差值）。
+    ech_ext_hits: int = 0
 
 
 @dataclass(frozen=True)

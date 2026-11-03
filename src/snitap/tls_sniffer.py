@@ -28,6 +28,7 @@ _HANDSHAKE_SERVER_HELLO = 0x02
 _EXT_SERVER_NAME = 0x0000
 _EXT_ALPN = 0x0010
 _EXT_SUPPORTED_VERSIONS = 0x002B
+_EXT_ECH = 0xFE0D      # encrypted_client_hello（RFC 9849），只判存在、不解析内容
 _SNI_HOST_NAME = 0
 
 
@@ -56,6 +57,13 @@ class HelloInfo:
     cipher_count: int = 0           # 仅 client：cipher_suites 列表总条数
     alpn: str = UNKNOWN
     ext_count: int = 0
+    # 本次 hello 携带 ECH 扩展（只做布尔判定，绝不解析扩展体——GREASE ECH
+    # 的 payload 是随机字节，解析只会炸掉嗅探路径）。
+    # 语义边界：仅表示「扩展存在」，**可能是 GREASE ECH**（RFC 9849 §6.2 允许
+    # 无 ECHConfig 的客户端发送假扩展，§10.10.4 明确两者对被动观察者不可区分）；
+    # 是否确证生效由上层 ``flow._merge`` 按外层 SNI 是否命中 ECH 掩护域名判定，
+    # 本层不做、也无法做该判定。
+    ech: bool = False
 
 
 class TlsSniffer:
@@ -167,6 +175,8 @@ def parse_client_hello(body: bytes) -> HelloInfo:
     依据——TLS1.3 客户端的 legacy_version 恒为 0x0303，不能因此误判 1.2；
     无 supported_versions 或全 GREASE 时回退 legacy_version。
     cipher 取列表里第一个非 GREASE 套件。
+    ``ech`` 只判 ``0xFE0D`` 扩展是否存在（外层 ClientHelloOuter 明文携带），
+    绝不解析扩展体——GREASE ECH 的 payload 是随机字节。
     """
     end = len(body)
     if end < 34:  # legacy_version(2) + random(32)
@@ -183,6 +193,7 @@ def parse_client_hello(body: bytes) -> HelloInfo:
     alpn = UNKNOWN
     sv_candidates: list[int] = []
     ext_count = 0
+    ech = False
 
     if pos != end:
         ext_total = _read_u16(body, pos)
@@ -205,6 +216,10 @@ def parse_client_hello(body: bytes) -> HelloInfo:
                 alpn = _parse_alpn(data)
             elif ext_type == _EXT_SUPPORTED_VERSIONS:
                 sv_candidates = _parse_client_supported_versions(data)
+            elif ext_type == _EXT_ECH:
+                # 只判存在：扩展体是 HPKE 密文（GREASE ECH 时是随机字节），
+                # 不解析内容，避免随机字节把嗅探路径带进异常分支。
+                ech = True
             pos += ext_len
 
     ciphers = [
@@ -231,6 +246,7 @@ def parse_client_hello(body: bytes) -> HelloInfo:
         cipher_count=len(ciphers),
         alpn=alpn,
         ext_count=ext_count,
+        ech=ech,
     )
 
 
@@ -254,6 +270,7 @@ def parse_server_hello(body: bytes) -> HelloInfo:
     alpn = UNKNOWN
     sv_raw = 0
     ext_count = 0
+    ech = False
 
     if pos != end:
         ext_total = _read_u16(body, pos)
@@ -277,6 +294,12 @@ def parse_server_hello(body: bytes) -> HelloInfo:
                 if ext_len != 2:
                     raise _ParseError
                 sv_raw = _read_u16(data, 0)
+            elif ext_type == _EXT_ECH:
+                # 服务端仅 HelloRetryRequest 场景会明文回带该扩展（罕见）；
+                # 正常 ServerHello 的 accept_confirmation 埋在 random[24..32]，
+                # 其推导依赖不可见的 ClientHelloInner.random，故这里**不代表**
+                # 服务端已接受 ECH——标记语义只有「本次 hello 携带 ECH 扩展」。
+                ech = True
             pos += ext_len
 
     version_raw = sv_raw if sv_raw else legacy_version
@@ -290,6 +313,7 @@ def parse_server_hello(body: bytes) -> HelloInfo:
         cipher_count=1,
         alpn=alpn,
         ext_count=ext_count,
+        ech=ech,
     )
 
 

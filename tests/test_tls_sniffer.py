@@ -3,7 +3,7 @@
 承接原 ``test_sni_sniffer.py`` 的 10 个用例语义（整包 / 逐字节 / 两段 /
 非 TLS / 无 SNI / 非 ClientHello / 超长 record / 缓冲超限 / 截断待续 /
 终态忽略追加），并扩充双向解析、GREASE 过滤、supported_versions 优先级、
-ALPN 首偏好、扩展区截断等用例。
+ALPN 首偏好、扩展区截断、ECH 扩展（只判存在、不解析内容）等用例。
 
 ``build_client_hello`` / ``build_server_hello`` 是共享夹具：
 ``test_forwarders.py`` 依赖 ``build_client_hello``（签名与行为不变）。
@@ -38,10 +38,17 @@ def build_client_hello(
     ciphers: tuple[int, ...] = (0x1301, 0x1302),
     supported: tuple[int, ...] = (0x0304,),
     legacy_version: int = 0x0303,
+    ech: bytes | None = None,
 ) -> bytes:
-    """构造一个结构合法的 TLS ClientHello（含可选 SNI/ALPN/版本扩展）。
+    """构造一个结构合法的 TLS ClientHello（含可选 SNI/ALPN/版本/ECH 扩展）。
 
     缺省行为与 v1 完全一致（13 01 13 02 两个套件 + supported_versions 0x0304）。
+
+    Args:
+        ech: ECH 扩展体的原始字节（``0xFE0D`` encrypted_client_hello）。
+            为 ``None`` 时完全不发该扩展（保持既有用例零改动）；传任意字节
+            （含 GREASE 风格的随机 payload）都会原样塞进扩展体，用于验证
+            「只判存在、不解析内容」。
     """
     extensions = b""
     if with_sni:
@@ -58,6 +65,8 @@ def build_client_hello(
             v.to_bytes(2, "big") for v in supported
         )
         extensions += b"\x00\x2b" + len(sv_list).to_bytes(2, "big") + sv_list
+    if ech is not None:
+        extensions += b"\xfe\x0d" + len(ech).to_bytes(2, "big") + ech
 
     cipher_bytes = b"".join(v.to_bytes(2, "big") for v in ciphers)
     body = (
@@ -278,6 +287,71 @@ class TlsSnifferClientTest(unittest.TestCase):
         )
 
 
+class ClientHelloEchTest(unittest.TestCase):
+    """ECH（encrypted_client_hello, 0xFE0D）只判「扩展存在」，不解析内容。"""
+
+    # GREASE ECH 的扩展体是客户端随机填充的假密文，这里用一段固定的
+    # 随机感字节模拟（确定性以便用例可复现）。
+    _GREASE_PAYLOAD = bytes.fromhex("9f3c11d702e84baa")
+
+    def test_ech_extension_marks_true(self) -> None:
+        payload = build_client_hello("ech.example", ech=b"\x00\x01\x02\x03")
+        info = parse_client_hello(TlsSnifferClientTest._hello_body(payload))
+        self.assertTrue(info.ech)
+        self.assertEqual(info.sni, "ech.example")
+
+    def test_no_ech_extension_marks_false(self) -> None:
+        payload = build_client_hello("plain.example")
+        info = parse_client_hello(TlsSnifferClientTest._hello_body(payload))
+        self.assertFalse(info.ech)
+
+    def test_grease_ech_random_payload_does_not_raise(self) -> None:
+        # 只判存在：随机字节绝不能被当作结构化内容解析（否则嗅探路径会抛异常）
+        payload = build_client_hello("grease.example", ech=self._GREASE_PAYLOAD)
+        sniffer = TlsSniffer(CLIENT)
+        sniffer.feed(payload)  # 不抛异常
+        self.assertIs(sniffer.state, SniffState.DONE)
+        assert sniffer.info is not None
+        self.assertTrue(sniffer.info.ech)
+        self.assertEqual(sniffer.info.sni, "grease.example")
+
+    def test_empty_ech_payload_marks_true(self) -> None:
+        # 0 长度的扩展体同样只判存在，不走任何内容解析分支
+        payload = build_client_hello("empty.example", ech=b"")
+        info = parse_client_hello(TlsSnifferClientTest._hello_body(payload))
+        self.assertTrue(info.ech)
+
+    def test_ech_and_sni_coexist(self) -> None:
+        # ECH 外层 ClientHelloOuter 仍带掩护域名的 SNI，两者必须都能取到
+        payload = build_client_hello(
+            "public-name.example", alpn=b"h2", ech=self._GREASE_PAYLOAD,
+        )
+        info = parse_client_hello(TlsSnifferClientTest._hello_body(payload))
+        self.assertTrue(info.ech)
+        self.assertEqual(info.sni, "public-name.example")
+        self.assertEqual(info.alpn, "h2")
+        self.assertEqual(info.tls_version, "TLS1.3")
+
+    def test_other_extension_type_not_confused_with_ech(self) -> None:
+        # 0xFE0C 与 0xFE0D 只差 1，不能被误判
+        fake = b"\x01\x02\x03\x04"
+        extensions = (
+            b"\xfe\x0c" + len(fake).to_bytes(2, "big") + fake      # 0xFE0C（非 ECH）
+            + b"\x00\x00\x00\x02\x00\x00"                          # SNI：空 host 列表
+        )
+        body = (
+            b"\x03\x03"
+            + bytes(range(32))
+            + b"\x20" + bytes(32)
+            + b"\x00\x02\x13\x01"
+            + b"\x01\x00"
+            + len(extensions).to_bytes(2, "big") + extensions
+        )
+        info = parse_client_hello(body)
+        self.assertFalse(info.ech)
+        self.assertEqual(info.ext_count, 2)
+
+
 class TlsSnifferServerTest(unittest.TestCase):
     """ServerHello 解析用例。"""
 
@@ -335,6 +409,29 @@ class TlsSnifferServerTest(unittest.TestCase):
         assert sniffer.info is not None
         self.assertEqual(sniffer.info.alpn, "h2")
 
+    def test_server_hello_without_ech_marks_false(self) -> None:
+        info = parse_server_hello(TlsSnifferClientTest._hello_body(build_server_hello()))
+        self.assertFalse(info.ech)
+
+    def test_server_hello_ech_extension_only_marks_presence(self) -> None:
+        # 服务端仅 HelloRetryRequest 会明文回带 0xFE0D。标记语义只是
+        # 「本次 hello 携带该扩展」，不代表服务端接受 ECH（接受确认在
+        # ServerHello.random[24..32]，被动不可判定）。
+        ech_data = bytes.fromhex("0011223344556677")
+        extensions = b"\xfe\x0d" + len(ech_data).to_bytes(2, "big") + ech_data
+        body = (
+            b"\x03\x03"
+            + bytes(range(32))
+            + b"\x20" + bytes(32)
+            + b"\x13\x01"
+            + b"\x00"
+            + len(extensions).to_bytes(2, "big") + extensions
+        )
+        info = parse_server_hello(body)
+        self.assertTrue(info.ech)
+        self.assertEqual(info.ext_count, 1)
+        self.assertIsNone(info.sni)  # ServerHello 恒无 SNI
+
 
 class HelloInfoDefaultsTest(unittest.TestCase):
     def test_default_fields_are_unknown(self) -> None:
@@ -343,6 +440,7 @@ class HelloInfoDefaultsTest(unittest.TestCase):
         self.assertEqual(info.cipher, UNKNOWN)
         self.assertEqual(info.alpn, UNKNOWN)
         self.assertIsNone(info.sni)
+        self.assertFalse(info.ech)
 
 
 if __name__ == "__main__":

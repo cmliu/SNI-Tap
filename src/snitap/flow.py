@@ -8,7 +8,12 @@ backstop 兜底）合并成一条。
 合并规则：
 - 拿到 ServerHello / 服务端 Initial → 三层一律取协商值，provisional=False；
 - 只拿到客户端方向 → 退回客户端偏好，provisional=True；
-- ``sni`` 只能来自客户端方向；QUIC 版本取自长包头（与 hello 无关）。
+- ``sni`` 只能来自客户端方向；QUIC 版本取自长包头（与 hello 无关）；
+- ``ech_ext`` 只取客户端方向的布尔判定，语义是「外层 ClientHelloOuter 明文
+  携带 ``0xFE0D`` 扩展」——**可能是 GREASE ECH**（RFC 9849 §6.2/§10.10.4）；
+- ``ech`` = ``ech_ext`` ∧ 外层 SNI 命中 ECH 掩护域名（``public_name``，见
+  :mod:`snitap.config` 的 ``ECH_PUBLIC_NAMES``），语义是「确证客户端发起真
+  ECH」；服务端是否接受在明文里不可判定，不做任何推断。
 
 生命周期：``__init__`` 用 running loop 的 ``call_later(backstop, _finish)``
 挂兜底定时器（取不到 running loop 时跳过，便于纯单测）；``_finish`` 幂等
@@ -21,6 +26,7 @@ import asyncio
 import logging
 from collections.abc import Callable
 
+from .config import is_ech_public_name
 from .protocol import UNKNOWN, LayerSource, ProtocolStack
 from .quic_sniffer import QuicSniffer, parse_long_header
 from .tls_sniffer import CLIENT, SERVER, HelloInfo, TlsSniffer
@@ -49,6 +55,12 @@ def _merge(
         source = LayerSource.CLIENT
         info = client_info
         provisional = True
+    # ECH 只可能由客户端方向发起（外层 ClientHelloOuter 明文携带），
+    # 服务端方向的同名字段仅覆盖罕见的 HRR 明文回带场景，不参与判定。
+    # ech_ext = 原始观测（可能是 GREASE ECH）；ech = 确证生效
+    # （扩展存在 ∧ 外层 SNI 是该 ECHConfig 的 public_name 掩护域名）。
+    ech_ext = bool(client_info is not None and client_info.ech)
+    ech = ech_ext and is_ech_public_name(client_info.sni if client_info is not None else None)
     return ProtocolStack(
         sni=client_info.sni if client_info is not None else None,
         transport=transport,
@@ -60,6 +72,8 @@ def _merge(
         alpn=info.alpn,
         alpn_source=source,
         provisional=provisional,
+        ech=ech,
+        ech_ext=ech_ext,
     )
 
 

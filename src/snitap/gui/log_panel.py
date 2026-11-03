@@ -1,12 +1,15 @@
 """协议栈嗅探日志区：只读富文本、自动滚底、上限 5000 行、主题可重染。
 
-每行固定五段：``时间戳  域名  应用层  传输层  安全层``（两空格分隔，
-provisional 行尾加 ``?``），顺序固定为 应用层 → 传输层 → 安全层。
+每行固定五段：``时间戳  域名  应用层  传输层  安全层``（两空格分隔），
+顺序固定为 应用层 → 传输层 → 安全层；安全层后可选 ``ECH`` 标记（两空格
+分隔，琥珀色，表示确证客户端发起了真 ECH——外层扩展存在 ∧ 外层 SNI 是
+ECH 掩护域名，GREASE ECH 不标记），provisional 行尾加 ``?``，
+因此行尾顺序是 安全层 → ECH → ``?``。
 
 Tk 的 ``Text`` 没有 HTML 富文本，改用 tag 实现「时间戳弱化、域名青色」；
-批量追加时先一次性 insert 整块文本，再用**四条** ``tag_add`` 批量打范围
+批量追加时先一次性 insert 整块文本，再用**五条** ``tag_add`` 批量打范围
 （``dim`` 合并时间戳与传输层两个区间），禁止逐行打 tag——单批 400 行的
-耗时远低于逐行五次 Tcl 调用的写法。
+耗时远低于逐行六次 Tcl 调用的写法。
 """
 
 from __future__ import annotations
@@ -25,6 +28,9 @@ MAX_LINES = 5000
 # 行内分隔符：两个空格（与 protocol.LOG_SEP 一致，GUI 层不 import 协议模块）
 _LOG_SEP = "  "
 
+# ECH 标记文案（与 protocol.ECH_MARK 一致，GUI 层不 import 协议模块）
+_ECH_MARK = "ECH"
+
 
 @dataclass(frozen=True)
 class LogEntry:
@@ -36,13 +42,14 @@ class LogEntry:
     transport: str
     security: str
     provisional: bool = False
+    ech: bool = False  # 确证生效的 ECH（= 扩展存在 ∧ SNI 是掩护域名，由上层判定）
 
 
 class LogPanel(tk.Frame):
     """协议栈嗅探日志面板。
 
     基于 ``tk.Text`` + 具名 tag 实现终端风富文本：时间戳/传输层 dim、
-    域名 cyan、应用层 muted、安全层 green、关闭换行、自动滚底；
+    域名 cyan、应用层 muted、安全层 green、ECH 标记 amber、关闭换行、自动滚底；
     ``deque(maxlen=MAX_LINES)`` 与文本同步裁剪，保证最多保留 MAX_LINES 行。
     切主题只需重配 tag 前景色，无需重建文本。
     """
@@ -99,12 +106,13 @@ class LogPanel(tk.Frame):
     # ------------------------------------------------------------------ 主题
 
     def _configure_tags(self) -> None:
-        """按当前主题重配五套 tag 的前景色与控件配色。"""
+        """按当前主题重配六套 tag 的前景色与控件配色。"""
         t = theme.current()
         self.text.tag_configure("dim", foreground=t.dim)        # 时间戳 + 传输层
         self.text.tag_configure("dom", foreground=t.cyan)       # 域名
         self.text.tag_configure("app", foreground=t.muted)      # 应用层
         self.text.tag_configure("security", foreground=t.green)  # 安全层
+        self.text.tag_configure("ech", foreground=t.amber)      # ECH 标记
         self.text.tag_configure("hint", foreground=t.dim)
         self.text.configure(
             bg=t.pane,
@@ -125,8 +133,8 @@ class LogPanel(tk.Frame):
     def append_lines(self, entries: Sequence[LogEntry]) -> None:
         """批量追加日志行并滚到底部。
 
-        整块 insert 一次，随后用四条 ``tag_add`` 批量标注
-        （dim / dom / app / security，dim 同时覆盖时间戳与传输层两个区间），
+        整块 insert 一次，随后用五条 ``tag_add`` 批量标注
+        （dim / dom / app / security / ech，dim 同时覆盖时间戳与传输层两个区间），
         单批 400 行的耗时远低于逐行打 tag 的写法。**不做列对齐填充**。
 
         Args:
@@ -144,7 +152,7 @@ class LogPanel(tk.Frame):
             mark = "?" if entry.provisional else ""
             line = (
                 f"{entry.ts}{_LOG_SEP}{entry.domain}{_LOG_SEP}{entry.app}"
-                f"{_LOG_SEP}{entry.transport}{_LOG_SEP}{entry.security}{mark}"
+                f"{_LOG_SEP}{entry.transport}{_LOG_SEP}{entry.security}"
             )
             ranges: list[tuple[str, int, int]] = []
             pos = 0
@@ -159,6 +167,13 @@ class LogPanel(tk.Frame):
                 pos += len(text)
                 ranges.append((tag, start, pos))
                 pos += len(_LOG_SEP)
+            if entry.ech:
+                # 安全层后接两个空格 + ECH；tag 只覆盖 ECH 三字符。
+                line += f"{_LOG_SEP}{_ECH_MARK}"
+                start = pos
+                pos += len(_ECH_MARK)
+                ranges.append(("ech", start, pos))
+            line += mark
             rendered.append((line, ranges))
             self._entries.append(entry)
 
@@ -167,13 +182,15 @@ class LogPanel(tk.Frame):
         self.text.configure(state="normal")
         self.text.insert("end", block)
 
-        # 四条批量 tag_add：每条传平铺的 [start, end, start, end, …]
-        tag_ranges: dict[str, list[str]] = {"dim": [], "dom": [], "app": [], "security": []}
+        # 五条批量 tag_add：每条传平铺的 [start, end, start, end, …]
+        tag_ranges: dict[str, list[str]] = {
+            "dim": [], "dom": [], "app": [], "security": [], "ech": [],
+        }
         for offset, (_line, ranges) in enumerate(rendered):
             line_no = base + offset + 1
             for tag, start, end in ranges:
                 tag_ranges[tag].extend((f"{line_no}.{start}", f"{line_no}.{end}"))
-        for tag in ("dim", "dom", "app", "security"):
+        for tag in ("dim", "dom", "app", "security", "ech"):
             if tag_ranges[tag]:
                 self.text.tag_add(tag, *tag_ranges[tag])
 

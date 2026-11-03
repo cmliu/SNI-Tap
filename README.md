@@ -18,7 +18,8 @@
 | TCP 转发 + TLS 双向嗅探 | 监听本地端口（默认 1234），逐连接转发；上行解析 ClientHello（SNI / 支持版本 / 套件 / ALPN），下行解析 ServerHello（协商值） |
 | UDP 转发 + QUIC Initial 嗅探 | 按客户端地址建立上游 socket 映射；双向解密 QUIC Initial（RFC 9001），重组 CRYPTO 帧还原 TLS 握手，兼容 QUIC / HTTP3（h3） |
 | 三层协议栈日志 | `HH:mm:ss  域名  应用层  传输层  安全层`，等宽字体，上限 5000 行自动滚动；仅有客户端方向时行尾加 `?`（provisional） |
-| 四元组统计 | 统计键 = (域名, 应用层, 传输层, 安全层)，任一层不同即独立成行；行内两行布局：域名/条形/次数 + 全宽摘要，双击复制 TSV（可粘进 Excel） |
+| ECH 识别 | **确证**真 ECH 时，日志安全层后追加琥珀色 `ECH`、统计行紧跟安全层标注 `ECH`、状态栏 footer 追加 `· ech K`。判据 = ClientHello 携带 `encrypted_client_hello`（`0xFE0D`）**且** 外层 SNI 命中 ECH 掩护域名名单（`ECHConfig.public_name`，默认 `cloudflare-ech.com`，可用环境变量 `SNITAP_ECH_PUBLIC_NAMES` 覆盖）。只看「扩展存在」会把 GREASE ECH 误当成真 ECH，故仅扩展存在的行**不标记**，只在 footer 计入 `· ech? X`。不解析密文；QUIC / HTTP3 同样覆盖 |
+| 四元组统计 | 统计键 = (域名, 应用层, 传输层, 安全层)，任一层不同即独立成行；安全层带 ` ECH` 后缀的行与非 ECH 行独立统计（后缀只加在确证行上，GREASE 行与普通行同键）；行内单行布局：域名 · 应用层 · 传输层 · 安全层 [· ECH] + 条形 + 次数，双击复制 TSV（可粘进 Excel） |
 | tcping 实时延迟 | 每 3 秒对目标 TCP 端口做一次握手测速（2 秒超时），状态区大字号显示 |
 | 零干扰 | 嗅探器是只读旁路、没有写路径；TCP 下行、UDP 均先转发后嗅探，解析成功/失败/放弃都不影响转发字节与时机 |
 | 优雅降级 | `cryptography` 缺失时 QUIC 仍输出传输层值（如 `QUIC/v1`），其余为 `-`，不崩不噪音 |
@@ -70,9 +71,32 @@ python -m snitap
 14:32:05  api.cloudflare.com  h2  TCP  TLS1.3/A128GCM?
 15:04:11  www.example.org  h3  QUIC/v1  TLS1.3/A128GCM
 15:04:12  -  -  QUIC/0xff00001d  -
+14:33:20  cloudflare-ech.com  h2  TCP  TLS1.3/A128GCM  ECH
+14:33:21  cloudflare-ech.com  h2  TCP  TLS1.3/A128GCM  ECH?
+14:33:40  test.cmliussss.dpdns.org  h2  TCP  TLS1.3/A128GCM
 ```
 
 行尾 `?` 表示只观测到客户端方向（客户端偏好而非服务端协商值）。
+
+安全层后的 `ECH` 表示**确证本次握手是真正的 ECH**：外层 SNI 是 ECH 掩护域名
+（`ECHConfig` 的 `public_name`，Cloudflare 为 `cloudflare-ech.com`），且
+ClientHello 明文携带了 `encrypted_client_hello` 扩展（`0xFE0D`）。
+
+它**不**表示服务端已经接受 ECH：接受确认写在 `ServerHello.random[24..32]`，
+其推导依赖不可见的 `ClientHelloInner.random`，被动嗅探无法判定（详见「已知限制」）。
+
+只为「扩展存在」不够：没有可用 ECHConfig 的客户端会按 RFC 9849 §6.2 发送**假的**
+ECH 扩展（GREASE ECH），两种情况的密文对旁观者不可区分（§10.10.4）。因此
+`test.cmliussss.dpdns.org` 这类「已关闭 ECH 却仍带扩展」的连接按 GREASE 处理，
+**不出 `ECH` 标记**，只计入底栏的疑似计数：
+
+```
+total 128 · 6 组 · ech 9 · ech? 4
+```
+
+`ech 9` = 确证真 ECH 9 次；`ech? 4` = 携带 ECH 扩展但外层 SNI 不是掩护域名
+（疑似 GREASE）4 次。掩护域名名单默认 `cloudflare-ech.com`，可用环境变量
+`SNITAP_ECH_PUBLIC_NAMES`（逗号分隔，大小写不敏感）覆盖，设为空串即关闭标记。
 
 ## 界面布局
 
@@ -80,14 +104,18 @@ python -m snitap
 ┌ 配置行：listen [1234] → [cf.090227.xyz 或 host:port]                    [▶ 转发监听 / ■ 停止]
 ├ 状态行：● 监听中   ping 23.4ms │ peer 104.16.x.x:443                     提示信息
 ├ 主区（上下分栏，可拖动，初始约 40:60）
-│   ├ 中：协议栈统计 · 本次启动（行内两行：域名 / 条形 / 次数 + 全宽摘要，
-│   │      按次数降序，双击复制 TSV）
-│   └ 下：stack log（等宽字体，时间戳/传输层弱化 / 域名青色 / 应用层灰 / 安全层绿，
-│          5000 行上限，自动滚动，[清除]）
+│   ├ 中：协议栈统计 · 本次启动（行内单行：域名 · 应用层 · 传输层 · 安全层 [· ECH]
+│   │      + 条形 + 次数，按次数降序，双击复制 TSV）
+│   └ 下：stack log（等宽字体，时间戳/传输层弱化 / 域名青色 / 应用层灰 / 安全层绿 /
+│          ECH 琥珀，5000 行上限，自动滚动，[清除]）
 └ 状态栏：tcp N │ udp N │ sni N                              Ctrl + L 清屏 · Enter 启停
 ```
 
 配色跟随系统亮暗（每 2 秒轮询一次注册表），暗色为终端风，亮色为日间版。
+
+统计面板底部 footer 显示累计摘要：`total 总条数 · M 组`，确证 ECH 时追加
+`· ech K`，存在「携带 ECH 扩展但 SNI 非掩护域名」（疑似 GREASE）时再追加
+`· ech? X`，统计行被截断时最后追加 `· 仅显示前 300 组`。
 
 ## 测试
 
@@ -95,12 +123,21 @@ python -m snitap
 python -m unittest discover -s tests -v
 ```
 
-- `tests/test_protocol.py` —— 命名映射单射性、GREASE 判定、统计键与快照契约
-- `tests/test_tls_sniffer.py` —— TLS 双向 hello 解析：分段重组 / GREASE 过滤 / supported_versions 优先级 / ALPN 首偏好 / 扩展区截断等
+- `tests/test_protocol.py` —— 命名映射单射性、GREASE 判定、统计键与快照契约、ECH 标记（`security_label` / 键分离 / `has_ech`）
+- `tests/test_tls_sniffer.py` —— TLS 双向 hello 解析：分段重组 / GREASE 过滤 / supported_versions 优先级 / ALPN 首偏好 / 扩展区截断 / ECH 扩展只判存在
 - `tests/test_quic_sniffer.py` —— QUIC Initial：独立 RFC 9001 加密夹具端到端、v2 salt/label、CRYPTO 分包重组、版本协商包、InvalidTag 降级
-- `tests/test_flow.py` —— TcpFlow / QuicFlow 聚合、provisional 语义、幂等性、零上报
+- `tests/test_flow.py` —— TcpFlow / QuicFlow 聚合、provisional 语义、ECH 双字段语义（掩护域名 → 确证；真实域名 → GREASE 不标记）、幂等性、零上报
+- `tests/test_stats.py` —— 四元组累计与排序稳定性、`ech_hits` / `ech_ext_hits` 双计数、ECH 行独立成行、`StatsEvent` 字段追加的向后兼容性
+- `tests/test_ech_public_name.py` —— ECH 掩护域名判定（精确匹配 / 大小写 / 空白 / 非法输入 / 相似域名 / `SNITAP_ECH_PUBLIC_NAMES` 覆盖 / 名单为空）与端到端验收场景
+- `tests/test_ech_integration.py` —— ECH 扩展的异常面（只允许 `_ParseError`）、流式分段、QUIC 复用、统计分键
+- `tests/test_gui_ech.py` —— 无头 GUI 断言：日志 `ech` tag 区间、统计表标记去重、footer `ech` / `ech?` 顺序
+- `tests/test_ech_audit.py` —— QA 独立复核：环境变量真 reload 覆盖、判定边界矩阵、位置参数兼容、footer 四组合、原始字节端到端、文档前缀逐字节校验
+- `tests/ech_env_isolation.py` —— 测试支撑（非用例）：把 `snitap.config` 隔离到默认名单基线，避免开发机导出 `SNITAP_ECH_PUBLIC_NAMES` 时假红
 - `tests/test_forwarders.py` —— TCP / UDP 转发集成测试：本地 echo 服务作目标，验证字节零干扰、三层栈上报、连接计数
 - `tests/test_parse_target.py` —— 目标输入解析
+
+> 若你在 shell 里导出了 `SNITAP_ECH_PUBLIC_NAMES`（README 教的做法），
+> 断言默认名单的用例会自动隔离到默认基线再跑，无需临时 unset 即可全绿。
 
 ## 打包为单文件 exe
 
@@ -144,11 +181,17 @@ SNI-Tap/
 │   ├── test_tls_sniffer.py
 │   ├── test_quic_sniffer.py
 │   ├── test_flow.py
+│   ├── test_stats.py
+│   ├── test_ech_public_name.py
+│   ├── test_ech_integration.py
+│   ├── test_ech_audit.py
+│   ├── test_gui_ech.py
+│   ├── ech_env_isolation.py
 │   ├── test_forwarders.py
 │   └── test_parse_target.py
 └── src/snitap/
     ├── __main__.py             # python -m snitap 入口
-    ├── config.py               # AppConfig、监听地址、默认值
+    ├── config.py               # AppConfig、监听地址、默认值、ECH 掩护域名名单
     ├── protocol.py             # 共享契约：UNKNOWN、名称映射、ProtocolStack、StackRow
     ├── tls_sniffer.py          # TLS 双向 hello 嗅探（纯函数 + 流式外壳）
     ├── quic_crypto.py          # QUIC Initial 密钥派生与解密（唯一 import cryptography）
@@ -162,8 +205,8 @@ SNI-Tap/
     ├── worker.py               # asyncio 事件循环宿主线程
     └── gui/
         ├── main_window.py      # 主窗口（配置区/状态区/主区/状态栏）
-        ├── log_panel.py        # 协议栈日志面板（LogEntry + 4 条批量 tag_add）
-        ├── stats_table.py      # 协议栈统计表（Canvas 自绘两行式布局）
+        ├── log_panel.py        # 协议栈日志面板（LogEntry + 5 条批量 tag_add）
+        ├── stats_table.py      # 协议栈统计表（Canvas 自绘单行式布局）
         ├── theme.py            # 暗/亮两套配色令牌 + 系统亮暗探测
         └── widgets.py          # 共用件：DPI 缩放、极细滚动条、输入框工厂
 ```
@@ -179,6 +222,25 @@ RFC 9001 派生双向密钥，header protection 按 FIX 正确处理（PN 长度
 first byte 的低 2 位，AAD 用未受保护头部），CRYPTO 帧乱序重组后委托与 TCP
 侧共享的 hello 纯函数解析。Handshake / 1-RTT 全加密，不碰。
 
+**ECH 判定依据**（两级，只有第二级才允许出 `ECH` 标记）：
+
+1. `ProtocolStack.ech_ext`（**原始观测**）= 外层 `ClientHelloOuter` 明文扩展区携带
+   `encrypted_client_hello`（扩展类型 `0xFE0D`，RFC 9849）。嗅探器**只判该扩展是否
+   存在**，把结果记成 `HelloInfo.ech`（布尔），并**完全不解析扩展体**——扩展体是
+   HPKE 密文，GREASE ECH 场景下更是客户端随机填充的假密文，一旦尝试解析就会把随机
+   字节带进异常分支、冒犯「嗅探绝不影响转发」的红线。
+2. `ProtocolStack.ech`（**确证生效**）= `ech_ext` **且** 外层 SNI 命中 ECH 掩护域名
+   （`config.ECH_PUBLIC_NAMES`，默认 `cloudflare-ech.com`；可用 `SNITAP_ECH_PUBLIC_NAMES`
+   覆盖；`is_ech_public_name` 精确匹配、对任意输入返回 bool 且不抛异常）。真 ECH 的
+   外层 SNI 必然是该 ECHConfig 的 `public_name`，而 GREASE ECH 的外层 SNI 是用户正在
+   访问的真实域名——这是单连接上唯一可用的现实判据，因为 RFC 9849 §10.10.4 明确真 ECH
+   与 GREASE ECH 对被动观察者不可区分。
+
+该判定经 `flow._merge()` 只取客户端方向（服务端仅在 HelloRetryRequest 这类罕见场景会
+明文回带同号扩展，不参与判定），最终 `ech` 落到 `security_label`（安全层追加 ` ECH`）
+→ 统计键第 4 元素、日志 `ECH` 段与 footer 的 `ech K` 计数；`ech_ext_hits - ech_hits`
+的差值以 `ech?` 计入 footer（疑似 GREASE）。QUIC / HTTP3 走同一对 hello 纯函数，自动覆盖。
+
 **线程模型**：Tk 主线程只做界面；asyncio 事件循环跑在独立 worker 线程。
 worker → GUI 走 `queue.Queue`（GUI 每 100 ms 批量拉取，StackEvent 逐条、
 StatsEvent 每秒快照）；GUI → worker 走 `loop.call_soon_threadsafe`。
@@ -187,7 +249,17 @@ StatsEvent 每秒快照）；GUI → worker 走 `loop.call_soon_threadsafe`。
 ## 已知限制
 
 - 每条连接只嗅探首个握手；连接复用、TLS 1.3 会话恢复不会重复记录
-- 启用 ECH（Encrypted Client Hello）的流量无法嗅探 SNI
+- **`ECH` = 确证客户端发起了真 ECH，仍不能判定服务端是否接受**：判据是「扩展存在
+  ∧ 外层 SNI 是掩护域名」。外层 `ClientHelloOuter` 的 SNI 是 ECHConfig 里的
+  `public_name` 掩护域名，而不是被加密的 inner 域名（inner 无密钥不可恢复）；
+  服务端的接受确认写在 `ServerHello.random[24..32]`，其推导依赖不可见的
+  `ClientHelloInner.random`，被动嗅探没有这个输入，明文唯一例外是 HelloRetryRequest
+  携带该扩展（罕见）。因此界面上的 `ECH` 一律表示「确证本次握手是真 ECH」，
+  不表示「服务端已接受」
+- **GREASE ECH 不会被标记，但判据是近似而非精确**：① 掩护域名名单是封闭枚举，
+  其他厂商的 `public_name` 未通过 `SNITAP_ECH_PUBLIC_NAMES` 增补时，其真 ECH 会被归入
+  `ech?`（疑似 GREASE）而不标记——宁可少标也不错标；② 用户直接访问掩护域名本身的
+  普通握手理论上也会被标记。名单为空（`SNITAP_ECH_PUBLIC_NAMES=""`）等于关闭标记
 - QUIC 只解 Initial 包（密钥轮换后不可用）；Handshake / 1-RTT 不处理
 - QUIC 服务端 Initial 与客户端 Initial 不在同一 UDP 会话窗口内时拿不到协商值（退化为 provisional）
 - 非 TLS 明文流量不做 Host 嗅探，原样透传（零上报）

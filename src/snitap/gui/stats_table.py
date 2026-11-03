@@ -1,14 +1,17 @@
-"""协议栈统计表：行内两行布局（域名/条形/次数 + 全宽摘要），Canvas 自绘。
+"""协议栈统计表：单行布局（域名 · 应用层 · 传输层 · 安全层 · ECH + 条形 + 次数），Canvas 自绘。
 
 ``ttk.Treeview`` 只能整行设色，做不到「同一段多色」，因此用 Canvas 自绘
 单元格；表头单独用 Frame 拼装以便不随内容滚动。
 
-行内两行布局（决策 D5，右栏约 366px 不加宽）：
-- 第一行：域名（cyan，省略号截断）+ 条形（green ▮）+ 次数（green 右对齐）；
-- 第二行：全宽 dim 摘要 ``app · transport · security``（应用层→传输层→安全层）。
+单行布局（v4）：
+- 左起依次 域名（cyan）→ 应用层（muted）→ 传输层（dim）→ 安全层（green）
+  → ``ECH``（amber，仅 ``has_ech`` 行，紧跟在安全层之后）；
+- 右端固定两列：条形（green ▮）+ 次数（green 右对齐），与表头对齐；
+- 域名先按「剩余空间扣掉协议栈实测宽度」截断，协议栈本身放不下时再从尾部
+  逐段省略号截断，保证 `TLS1.3/…` 与 `ECH` 在窄窗口下也有机会显示。
 
-为支撑上千组合，绘制做了**可见行虚拟化**（只画视口内的行）与**分缓存
-截断宽度缓存**（域名与摘要各一份，宽度变化只失效对应缓存）。
+为支撑上千组合，绘制做了**可见行虚拟化**（只画视口内的行）与**域名截断
+宽度缓存**（宽度变化即失效）。
 """
 
 from __future__ import annotations
@@ -21,11 +24,17 @@ from . import theme
 from ..protocol import StackRow
 from .widgets import SlimScrollbar, px
 
-_BAR_MAX_LEN = 6         # 条形最大长度（▮ 个数；行高变大后缩短腾出摘要行）
+_BAR_MAX_LEN = 6         # 条形最大长度（▮ 个数）
 _BAR_COLUMN_WIDTH = 60
 _COUNT_COLUMN_WIDTH = 56
-_ROW_HEIGHT = 40         # 行内两行布局
+_ROW_HEIGHT = 28         # 单行布局
 _HEADER_HEIGHT = 30
+
+# ECH 标记文案（与 protocol.ECH_MARK 一致）
+_ECH_MARK = "ECH"
+
+_LOG_SEP = "  "          # 段间分隔：两个空格（与日志区一致）
+_MIN_DOMAIN_W = 48       # 域名列最小宽度（px），再小就优先压协议栈
 
 # 截断缓存上限：超过整体清空，防止长会话下无界增长
 _ELIDE_CACHE_MAX = 4096
@@ -49,7 +58,7 @@ def _elide(text: str, font: tkfont.Font, max_width: int) -> str:
 
 
 class StatsTable(tk.Frame):
-    """协议栈统计表：域名（青）/ 条形（绿）/ 次数（绿），第二行全宽 dim 摘要。"""
+    """协议栈统计表：单行式 ``域名 · 协议栈 · ECH`` + 条形 + 次数。"""
 
     def __init__(self, master: tk.Misc, font: tkfont.Font, header_font: tkfont.Font) -> None:
         """构建统计表。
@@ -71,11 +80,9 @@ class StatsTable(tk.Frame):
         self._bar_col_w = px(_BAR_COLUMN_WIDTH)
         self._count_col_w = px(_COUNT_COLUMN_WIDTH)
 
-        # 双缓存（共享约定 15）：域名与摘要各自记录宽度，宽度变化只清各自缓存
+        # 截断缓存（共享约定 15）：只缓存域名，协议栈各段按行实测
         self._domain_cache: dict[str, str] = {}
-        self._caption_cache: dict[str, str] = {}
         self._domain_width = -1
-        self._caption_width = -1
 
         self._build_header()
         self._build_body()
@@ -238,7 +245,7 @@ class StatsTable(tk.Frame):
         return first, max(first, last)
 
     def _render(self) -> None:
-        """重绘可见行（虚拟化：只画视口内的行；行内两行布局）。"""
+        """重绘可见行（虚拟化：只画视口内的行；单行布局）。"""
         t = theme.current()
         self.canvas.delete("row")
         width = self.canvas.winfo_width()
@@ -251,54 +258,103 @@ class StatsTable(tk.Frame):
 
         bar_left = width - self._count_col_w - self._bar_col_w
         domain_x = px(6)
-        domain_max_w = max(px(24), bar_left - px(12))
-        caption_max_w = max(px(24), width - px(12))
-        if domain_max_w != self._domain_width:  # 宽度变了，只失效域名缓存
-            self._domain_width = domain_max_w
+        left_limit = max(domain_x + px(24), bar_left - px(8))
+        avail = left_limit - domain_x
+        if avail != self._domain_width:  # 宽度变了，只失效域名缓存
+            self._domain_width = avail
             self._domain_cache.clear()
-        if caption_max_w != self._caption_width:  # 宽度变了，只失效摘要缓存
-            self._caption_width = caption_max_w
-            self._caption_cache.clear()
-        if len(self._domain_cache) + len(self._caption_cache) > _ELIDE_CACHE_MAX:
+        if len(self._domain_cache) > _ELIDE_CACHE_MAX:
             self._domain_cache.clear()
-            self._caption_cache.clear()
         bar_x = bar_left + px(6)
         count_x = width - px(6)
+        sep_w = self._font.measure(_LOG_SEP)
         max_count = max((row.count for row in self._rows), default=1) or 1
 
         first, last = self._visible_range(height)
         for index in range(first, last):
             row = self._rows[index]
             top = index * self._row_h
-            line1_y = top + self._row_h * 0.32
-            line2_y = top + self._row_h * 0.72
+            mid_y = top + self._row_h * 0.5
             self.canvas.create_rectangle(
                 0, top, width, top + self._row_h,
                 fill=self._background_for(index), outline="", tags="row",
             )
-            # 第一行：域名 / 条形 / 次数
+
+            # 协议栈段：应用层 → 传输层 → 安全层 → ECH（紧随 TLS 版本之后）
+            domain_max_w, segments = self._compose_line(row, t, avail)
+            domain = self._elided_domain(row.domain, domain_max_w)
             self.canvas.create_text(
-                domain_x, line1_y,
-                text=self._elided_domain(row.domain, domain_max_w),
+                domain_x, mid_y,
+                text=domain,
                 anchor="w", fill=t.cyan, font=self._font, tags="row",
             )
+
+            x = domain_x + self._font.measure(domain) + sep_w
+            for text, fill in segments:
+                if x >= left_limit:
+                    break
+                room = left_limit - x
+                if self._font.measure(text) > room:
+                    text = _elide(text, self._font, room)
+                if not text:
+                    break
+                self.canvas.create_text(
+                    x, mid_y,
+                    text=text,
+                    anchor="w", fill=fill, font=self._font, tags="row",
+                )
+                x += self._font.measure(text) + sep_w
+
             bar_len = max(1, round(row.count / max_count * _BAR_MAX_LEN))
             self.canvas.create_text(
-                bar_x, line1_y,
+                bar_x, mid_y,
                 text="\u25ae" * bar_len,
                 anchor="w", fill=t.green, font=self._font, tags="row",
             )
             self.canvas.create_text(
-                count_x, line1_y,
+                count_x, mid_y,
                 text=str(row.count),
                 anchor="e", fill=t.green, font=self._font, tags="row",
             )
-            # 第二行：全宽 dim 摘要（应用层 · 传输层 · 安全层）
-            self.canvas.create_text(
-                domain_x, line2_y,
-                text=self._elided_caption(row.caption(), caption_max_w),
-                anchor="w", fill=t.dim, font=self._font, tags="row",
-            )
+
+    def _compose_line(
+        self, row: StackRow, t: theme.Theme, avail: int,
+    ) -> tuple[int, list[tuple[str, str]]]:
+        """按空间优先级决定域名宽度与协议栈段。
+
+        优先级：安全层 / ECH > 域名 > 传输层 > 应用层。窗口够宽时全显示；
+        变窄先丢应用层、再丢传输层，始终保住 ``TLS1.3/…`` 与 ``ECH``。
+
+        Returns:
+            ``(域名可用宽度, 协议栈段列表)``。
+        """
+        sep_w = self._font.measure(_LOG_SEP)
+        tail: list[tuple[str, str]] = [(self._security_without_ech(row.security), t.green)]
+        if row.has_ech:
+            tail.append((_ECH_MARK, t.amber))
+        for head in (
+            [(row.app, t.muted), (row.transport, t.dim)],
+            [(row.transport, t.dim)],
+            [],
+        ):
+            segments = head + tail
+            width = sum(self._font.measure(text) for text, _ in segments)
+            width += sep_w * max(0, len(segments) - 1)
+            domain_w = avail - width - sep_w
+            if domain_w >= px(_MIN_DOMAIN_W):
+                return domain_w, segments
+        # 极限窄：只留安全层 / ECH，域名按剩余宽度硬截
+        width = sum(self._font.measure(text) for text, _ in tail)
+        width += sep_w * max(0, len(tail) - 1)
+        return max(px(24), avail - width - sep_w), tail
+
+    @staticmethod
+    def _security_without_ech(security: str) -> str:
+        """剥掉安全层末尾的 `` ECH`` 后缀：该标记改由紧跟其后的琥珀色段承担。"""
+        suffix = f" {_ECH_MARK}"
+        if security.endswith(suffix):
+            return security[:-len(suffix)]
+        return security
 
     def _elided_domain(self, domain: str, max_width: int) -> str:
         """带缓存的域名省略号截断（同一宽度下命中缓存，不做 font.measure 二分）。"""
@@ -306,14 +362,6 @@ class StatsTable(tk.Frame):
         if cached is None:
             cached = _elide(domain, self._font, max_width)
             self._domain_cache[domain] = cached
-        return cached
-
-    def _elided_caption(self, caption: str, max_width: int) -> str:
-        """带缓存的摘要省略号截断（与域名缓存互相独立）。"""
-        cached = self._caption_cache.get(caption)
-        if cached is None:
-            cached = _elide(caption, self._font, max_width)
-            self._caption_cache[caption] = cached
         return cached
 
     def _background_for(self, index: int) -> str:
