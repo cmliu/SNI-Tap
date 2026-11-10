@@ -320,5 +320,60 @@ class WorkerStopTest(unittest.TestCase):
             srv.close()
 
 
+class UpstreamFailureLogTest(unittest.IsolatedAsyncioTestCase):
+    """回归：上游连接失败日志里的目标地址必须无歧义（IPv6 要带方括号）。
+
+    背景：旧实现 ``f"{target_host}:{target_port}"`` 在 IPv6 目标上会拼出
+    ``::1:53211`` 这类地址与端口粘连的字符串，日志里无法切分。
+    本用例走真实连接（目标端口预占后释放 → 必然 ConnectionRefused），
+    不 mock 任何网络调用。
+    """
+
+    async def _failure_message(self, target_host: str, family: int) -> tuple[str, int]:
+        """对指定目标起转发器并触发一次上游失败，返回 (错误文案, 目标端口)。"""
+        probe = socket.socket(socket.AF_INET6 if family == socket.AF_INET6 else socket.AF_INET)
+        try:
+            probe.bind((target_host, 0))
+            target_port = probe.getsockname()[1]
+        finally:
+            probe.close()
+
+        errors: list[str] = []
+        forwarder = TcpForwarder(
+            AppConfig(listen_port=0, target_host=target_host, target_port=target_port),
+            on_stack=lambda stack: None,
+            on_conn_change=lambda n: None,
+            on_error=errors.append,
+        )
+        await forwarder.start()
+        writer = None
+        try:
+            _reader, writer = await asyncio.open_connection("127.0.0.1", forwarder.port)
+            # 本机回环上连接未监听端口约 2s 才回 RST（SYN 重传），故上限给到 5s；
+            # 一旦上报立即跳出，不做固定 sleep。
+            for _ in range(100):
+                if errors:
+                    break
+                await asyncio.sleep(0.05)
+        finally:
+            if writer is not None:
+                writer.close()
+            await forwarder.stop()
+        self.assertTrue(errors, "上游连接失败必须上报一条错误")
+        return errors[0], target_port
+
+    async def test_ipv6_target_log_is_bracketed(self) -> None:
+        """IPv6 目标失败日志写作 ``[::1]:<port>``，不得粘连成 ``::1:<port>``。"""
+        message, port = await self._failure_message("::1", socket.AF_INET6)
+        self.assertIn(f"连接目标 [::1]:{port} 失败", message)
+        self.assertNotIn(f"::1:{port}", message)
+
+    async def test_ipv4_target_log_unchanged(self) -> None:
+        """IPv4 目标失败日志保持 ``127.0.0.1:<port>``（不加方括号）。"""
+        message, port = await self._failure_message("127.0.0.1", socket.AF_INET)
+        self.assertIn(f"连接目标 127.0.0.1:{port} 失败", message)
+        self.assertNotIn("[127.0.0.1]", message)
+
+
 if __name__ == "__main__":
     unittest.main()

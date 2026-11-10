@@ -15,6 +15,7 @@ from collections.abc import Callable
 from .config import LISTEN_HOST, AppConfig
 from .flow import TcpFlow
 from .protocol import ProtocolStack
+from .tcping import format_host_port
 
 log = logging.getLogger(__name__)
 
@@ -109,7 +110,11 @@ class TcpForwarder:
                     timeout=_CONNECT_TIMEOUT,
                 )
             except Exception as exc:
-                self._on_error_safe(f"连接目标 {self._config.target_host}:{self._config.target_port} 失败：{exc}")
+                # 目标可能是 IPv6 字面量，统一按方括号写法渲染，避免日志里
+                # "2001:db8::1:443" 这种地址与端口粘连的歧义输出。
+                self._on_error_safe(
+                    f"连接目标 {format_host_port(self._config.target_host, self._config.target_port)} 失败：{exc}"
+                )
                 return
             self._writers.add(upstream_writer)
 
