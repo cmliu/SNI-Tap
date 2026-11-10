@@ -5,7 +5,10 @@
 
 核心约定：
 - 统计键 = ``(domain, app, transport_label, security)`` 有序四元组，
-  ``provisional`` 与各 ``*_source`` 不进键——统计表是聚合真值，日志是单次观测；
+  ``provisional`` 与各 ``*_source`` **原值**不进键——统计表是聚合真值，日志是单次观测；
+  但 :attr:`ProtocolStack.app` 会把「服务端 hello 已到、ALPN 协商值不可知、
+  回退客户端偏好」这一种情形渲染成 ``h3?``，于是「真协商到 h3」与「只是偏好 h3」
+  天然落在两个键上、独立成行；
   安全层可能带 `` ECH`` 后缀（见 :attr:`ProtocolStack.security_label`），
   ECH 与非 ECH 的同一组合因此天然分成两行统计；
 - 名称表必须单射（不同 ID 不得映射到同一字符串），否则「任一层不同即
@@ -160,7 +163,25 @@ class ProtocolStack:
 
     @property
     def app(self) -> str:
-        """应用层值（ALPN）。"""
+        """应用层展示值（ALPN；协商值不可知时带 ``?`` 后缀）。
+
+        TLS 1.3 的 ALPN 在**加密的** EncryptedExtensions 里（RFC 8446 §4.2.10），
+        明文 ServerHello 解不出协商值，:func:`snitap.flow._merge` 此时会回退成
+        客户端偏好。若不加以区分，「客户端只是偏好 h3」会被显示成「已协商到 h3」
+        ——例如服务端只支持 http/1.1 时界面照样写 ``h3``，那是谎报。
+
+        加 ``?`` 的条件（三者同时成立）：已拿到服务端 hello（``provisional`` 为假）
+        ∧ ``alpn_source`` 是客户端回退 ∧ ``alpn`` 已知。**只有客户端方向**时
+        （``provisional`` 为真）整行由 GUI 在**行首**加 ``~``，此处不再加——
+        行首标记与字段内的 ``?`` 分处两个位置，不会混成 ``h3? … ?``；
+        ``alpn`` 未知时保持 ``-``，不产出 ``-?``。
+        """
+        if (
+            not self.provisional
+            and self.alpn_source == LayerSource.CLIENT
+            and self.alpn != UNKNOWN
+        ):
+            return f"{self.alpn}{PROVISIONAL_MARK}"
         return self.alpn
 
     @property
@@ -188,8 +209,11 @@ class ProtocolStack:
 
     @property
     def key(self) -> tuple[str, str, str, str]:
-        """统计键：(域名, 应用层, 传输层, 安全层)；provisional/source 不进键。
+        """统计键：(域名, 应用层, 传输层, 安全层)。
 
+        应用层用 :attr:`app`（可能带 ``?`` 后缀），因此「协商到 h3」与
+        「ALPN 不可知、回退客户端偏好 h3」是**两个键**、统计表独立成行；
+        ``provisional`` / ``tls_source`` / ``cipher_source`` 的原值仍不进键。
         安全层用 :attr:`security_label`，故带 `` ECH`` 后缀的行与非 ECH 行
         天然是不同键、独立统计。
         """

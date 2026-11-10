@@ -3,7 +3,7 @@
 不打开真实窗口交互，只创建离屏 Tk 根窗口后直接断言控件状态：
 
 - ``LogPanel``：``ech`` tag 的区间必须恰好覆盖 ``ECH`` 三个字符（不能把
-  分隔空格或行尾 ``?`` 圈进去），且位置在 ``security`` 之后、``?`` 之前；
+  分隔空格或行首 ``~`` 圈进去），且位置在 ``security`` 之后、行尾之前；
 - ``StatsTable``：单行布局下 ``has_ech`` 行的画布上只能出现一处 ``ECH`` 文本
   （紧跟在安全层之后），但 ``copy_row`` 的 TSV **仍带** `` ECH``
   ——「显示去重、数据不丢」；
@@ -111,17 +111,20 @@ class LogPanelEchTagTest(_TkTestCase):
         panel.append_lines([_entry(ech=True)])
         self.assertEqual(self._tag_slices(panel, "ech"), [ECH_MARK])
 
-    def test_ech_tag_excludes_separator_and_question_mark(self) -> None:
+    def test_ech_tag_excludes_separator_and_provisional_mark(self) -> None:
         panel = self._panel()
         panel.append_lines([_entry(ech=True, provisional=True)])
         line = panel.text.get("1.0", "1.end")
-        self.assertTrue(line.endswith(f"{ECH_MARK}?"))
+        # provisional 标记已移到行首，行尾只剩 ECH，不再追加 ?
+        self.assertTrue(line.startswith("~"))
+        self.assertTrue(line.endswith(f"  {ECH_MARK}"))
+        self.assertNotIn("?", line)
         self.assertEqual(self._tag_slices(panel, "ech"), [ECH_MARK])
         for slice_text in self._tag_slices(panel, "ech"):
             self.assertNotIn("?", slice_text)
             self.assertNotIn(" ", slice_text)
 
-    def test_ech_sits_after_security_and_before_question_mark(self) -> None:
+    def test_ech_sits_after_security_and_before_line_end(self) -> None:
         panel = self._panel()
         panel.append_lines([_entry(ech=True, provisional=True)])
         security_ranges = panel.text.tag_ranges("security")
@@ -133,9 +136,26 @@ class LogPanelEchTagTest(_TkTestCase):
         self.assertLess(
             int(security_end.split(".")[1]), int(ech_start.split(".")[1])
         )
-        # ? 紧接 ECH 之后，且未被打上 ech tag
-        gap = panel.text.get(ech_end, "1.end")
-        self.assertEqual(gap, "?")
+        # ECH 之后到行尾已无任何字符（provisional 标记位于行首）
+        self.assertEqual(panel.text.get(ech_end, "1.end"), "")
+
+    def test_provisional_mark_at_line_start_keeps_timestamps_aligned(self) -> None:
+        """行首 ~ 只占一列；非 provisional 行用空格占位，时间戳列必须对齐。"""
+        panel = self._panel()
+        panel.append_lines(
+            [
+                _entry(domain="a.example", provisional=True),
+                _entry(domain="b.example", provisional=False),
+            ]
+        )
+        first = panel.text.get("1.0", "1.end")
+        second = panel.text.get("2.0", "2.end")
+        self.assertTrue(first.startswith("~12:00:00"))
+        self.assertTrue(second.startswith(" 12:00:00"))
+        self.assertEqual(first[1:9], second[1:9])
+        self.assertEqual(first[1:9], "12:00:00")
+        # mark tag 只覆盖 provisional 行的 ~
+        self.assertEqual(self._tag_slices(panel, "mark"), ["~"])
 
     def test_no_ech_entry_leaves_tag_empty(self) -> None:
         panel = self._panel()
@@ -167,11 +187,11 @@ class LogPanelEchTagTest(_TkTestCase):
         panel = self._panel()
         panel.append_lines([_entry(ech=True, provisional=True)])
         line = panel.text.get("1.0", "1.end")
-        self.assertEqual(line, "12:00:00  ech.example  h2  TCP  TLS1.3/A128GCM  ECH?")
+        self.assertEqual(line, "~12:00:00  ech.example  h2  TCP  TLS1.3/A128GCM  ECH")
         # 五段正文之间共 5 个双空格分隔符（时间戳→域名→应用→传输→安全→ECH）
         self.assertEqual(line.count("  "), 5)
         self.assertLess(line.index("TLS1.3"), line.index(ECH_MARK))
-        self.assertLess(line.index(ECH_MARK), line.index("?"))
+        self.assertLess(line.index("~"), line.index("12:00:00"))
 
     def test_entry_snapshot_keeps_flag(self) -> None:
         panel = self._panel()

@@ -25,6 +25,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from snitap.config import AppConfig
 from snitap.protocol import ProtocolStack
 from snitap.tcp_forwarder import TcpForwarder
+from snitap import udp_forwarder as udp_forwarder_module
 from snitap.udp_forwarder import UdpForwarder
 from snitap.worker import Worker
 from test_tls_sniffer import build_client_hello
@@ -165,6 +166,177 @@ class UdpForwarderTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.2)
             self.assertEqual(self.stacks, [])
         finally:
+            transport.close()
+
+    async def test_first_datagram_is_fed_to_sniffer(self) -> None:
+        """FIX-7 回归：新会话的**首个** UDP 数据报必须喂给 QuicFlow。
+
+        客户端首个数据报就是承载 ClientHello 的 QUIC Initial（CRYPTO offset 0），
+        漏掉它以后续 Initial 只有 offset>0 的片段，永远拼不出 hello——
+        症状是整条会话只上报 ``QUIC/v1`` 而 SNI/ALPN/TLS 全为 ``-``。
+        """
+        loop = asyncio.get_running_loop()
+        fed: list[bytes] = []
+
+        class _SpyFlow:
+            def __init__(self, on_stack) -> None:  # noqa: ANN001
+                self._on_stack = on_stack
+
+            def feed_client(self, datagram: bytes) -> None:
+                fed.append(datagram)
+
+            def feed_server(self, datagram: bytes) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        class ClientProtocol(asyncio.DatagramProtocol):
+            def __init__(self) -> None:
+                self.future: asyncio.Future[bytes] = loop.create_future()
+
+            def datagram_received(self, data: bytes, addr) -> None:  # noqa: ANN001
+                if not self.future.done():
+                    self.future.set_result(data)
+
+        transport, protocol = await loop.create_datagram_endpoint(
+            ClientProtocol, local_addr=("127.0.0.1", 0)
+        )
+        original = udp_forwarder_module.QuicFlow
+        udp_forwarder_module.QuicFlow = _SpyFlow  # type: ignore[assignment]
+        try:
+            forwarder = UdpForwarder(
+                AppConfig(listen_port=0, target_host="127.0.0.1", target_port=self.echo_port),
+                on_stack=self.stacks.append,
+                on_session_change=self.session_counts.append,
+                on_error=self.errors.append,
+            )
+            await forwarder.start()
+            try:
+                transport.sendto(b"first-datagram", ("127.0.0.1", forwarder.local_port))
+                data = await asyncio.wait_for(protocol.future, timeout=3.0)
+                self.assertEqual(data, b"echo:first-datagram")  # 转发没被影响
+                self.assertEqual(fed[0], b"first-datagram")
+            finally:
+                await forwarder.stop()
+        finally:
+            udp_forwarder_module.QuicFlow = original  # type: ignore[assignment]
+            transport.close()
+
+    async def test_each_datagram_is_fed_exactly_once(self) -> None:
+        """FIX-7 之后每个数据报仍只喂嗅探一次——不允许首包被「补喂」成两次。
+
+        重复喂入在 ``_on_crypto`` 的 offset 逻辑下数据是幂等的（offset <
+        next_offset 整段丢弃），但**尝试预算不幂等**：未 finished 时重复喂会
+        多消耗一次 ``MAX_ATTEMPTS``，可能提前放弃。故必须严格 1:1。
+        """
+        loop = asyncio.get_running_loop()
+        fed: list[bytes] = []
+        received: list[bytes] = []
+
+        class _SpyFlow:
+            def __init__(self, on_stack) -> None:  # noqa: ANN001
+                pass
+
+            def feed_client(self, datagram: bytes) -> None:
+                fed.append(datagram)
+
+            def feed_server(self, datagram: bytes) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        class ClientProtocol(asyncio.DatagramProtocol):
+            def __init__(self) -> None:
+                self.got = 0
+
+            def datagram_received(self, data: bytes, addr) -> None:  # noqa: ANN001
+                received.append(data)
+
+        transport, _protocol = await loop.create_datagram_endpoint(
+            ClientProtocol, local_addr=("127.0.0.1", 0)
+        )
+        original = udp_forwarder_module.QuicFlow
+        udp_forwarder_module.QuicFlow = _SpyFlow  # type: ignore[assignment]
+        try:
+            forwarder = UdpForwarder(
+                AppConfig(listen_port=0, target_host="127.0.0.1", target_port=self.echo_port),
+                on_stack=self.stacks.append,
+                on_session_change=self.session_counts.append,
+                on_error=self.errors.append,
+            )
+            await forwarder.start()
+            try:
+                sent = [b"dgram-%d" % i for i in range(4)]
+                for payload in sent:
+                    transport.sendto(payload, ("127.0.0.1", forwarder.local_port))
+                    await asyncio.sleep(0.05)  # 让会话先建好，再发后续包
+                await asyncio.sleep(0.3)
+                self.assertEqual(fed, sent)  # 严格 1:1，无重复、无遗漏
+                self.assertEqual(received, [b"echo:" + p for p in sent])  # 转发完好
+            finally:
+                await forwarder.stop()
+        finally:
+            udp_forwarder_module.QuicFlow = original  # type: ignore[assignment]
+            transport.close()
+
+    async def test_sniffer_exception_does_not_block_forwarding(self) -> None:
+        """嗅探抛出任意异常时，转发主路径必须完全不受影响（零干扰红线）。"""
+        loop = asyncio.get_running_loop()
+        fed: list[bytes] = []
+
+        class _ExplodingFlow:
+            def __init__(self, on_stack) -> None:  # noqa: ANN001
+                pass
+
+            def feed_client(self, datagram: bytes) -> None:
+                fed.append(datagram)
+                raise RuntimeError("嗅探炸了")
+
+            def feed_server(self, datagram: bytes) -> None:
+                raise RuntimeError("回程嗅探炸了")
+
+            def close(self) -> None:
+                pass
+
+        class ClientProtocol(asyncio.DatagramProtocol):
+            def __init__(self) -> None:
+                self.futures: list[asyncio.Future[bytes]] = []
+
+            def datagram_received(self, data: bytes, addr) -> None:  # noqa: ANN001
+                self.futures.append(asyncio.get_running_loop().create_future())
+                self.futures[-1].set_result(data)
+
+        transport, protocol = await loop.create_datagram_endpoint(
+            ClientProtocol, local_addr=("127.0.0.1", 0)
+        )
+        original = udp_forwarder_module.QuicFlow
+        udp_forwarder_module.QuicFlow = _ExplodingFlow  # type: ignore[assignment]
+        try:
+            forwarder = UdpForwarder(
+                AppConfig(listen_port=0, target_host="127.0.0.1", target_port=self.echo_port),
+                on_stack=self.stacks.append,
+                on_session_change=self.session_counts.append,
+                on_error=self.errors.append,
+            )
+            await forwarder.start()
+            try:
+                for i in range(3):
+                    transport.sendto(b"boom-%d" % i, ("127.0.0.1", forwarder.local_port))
+                    await asyncio.sleep(0.08)
+                await asyncio.sleep(0.3)
+                self.assertEqual(len(fed), 3)  # 嗅探确实被调用了（且都抛了）
+                # 回程也照常送达：字节完全一致
+                self.assertEqual(
+                    [f.result() for f in protocol.futures],
+                    [b"echo:boom-%d" % i for i in range(3)],
+                )
+                self.assertEqual(self.errors, [])  # 嗅探异常不得升级为 on_error
+            finally:
+                await forwarder.stop()
+        finally:
+            udp_forwarder_module.QuicFlow = original  # type: ignore[assignment]
             transport.close()
 
 

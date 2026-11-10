@@ -616,8 +616,10 @@ class UserScenarioEndToEndTest(_ConfigIsolatedCase):
 
             # 1) 真实域名行整体不含 ECH 文本
             self.assertNotIn(ECH_MARK, grease_line)
-            # 2) 掩护域名行在安全层之后出现 ECH（仅客户端方向 → provisional 的 ? 收尾）
-            self.assertTrue(confirmed_line.endswith(f"  {ECH_MARK}?"))
+            # 2) 掩护域名行在安全层之后出现 ECH；整行为客户端偏好 → 行首 ~（行尾不再加 ?）
+            self.assertTrue(confirmed_line.endswith(f"  {ECH_MARK}"))
+            self.assertTrue(confirmed_line.startswith("~"))
+            self.assertNotIn("?", confirmed_line)
             # 3) 全文只出现一次 ECH
             self.assertEqual(text.count(ECH_MARK), 1)
 

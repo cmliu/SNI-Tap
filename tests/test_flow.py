@@ -17,8 +17,16 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 from ech_env_isolation import ConfigIsolatedCase
 from snitap.flow import QuicFlow, TcpFlow
-from snitap.protocol import UNKNOWN, ProtocolStack
+from snitap.protocol import UNKNOWN, LayerSource, ProtocolStack
 from test_tls_sniffer import build_client_hello, build_server_hello
+
+try:  # QUIC 加密夹具（与 test_quic_sniffer 共用，避免两处各写一份）
+    from test_quic_sniffer import _V1 as _QUIC_V1
+    from test_quic_sniffer import _encrypt_initial, _hello_message
+
+    _HAS_QUIC_FIXTURE = True
+except Exception:  # pragma: no cover - 环境无 cryptography
+    _HAS_QUIC_FIXTURE = False
 
 
 class TcpFlowTest(unittest.TestCase):
@@ -60,6 +68,29 @@ class TcpFlowTest(unittest.TestCase):
         self.assertEqual(stack.tls_version, "TLS1.3")
         self.assertEqual(stack.cipher, "A256GCM")
         self.assertEqual(stack.security, "TLS1.3/A256GCM")
+
+    def test_alpn_falls_back_to_client_when_server_is_silent(self) -> None:
+        """TLS 1.3 的 ALPN 在加密的 EncryptedExtensions 里（RFC 8446 §4.2.10），
+        明文 ServerHello 不含该扩展——此时应用层必须回退到客户端偏好，
+        否则任何 TLS 1.3 连接的 app 都会显示 "-"；回退值还要带 `?` 后缀，
+        以免「只是偏好 h3」被当成「已协商到 h3」。"""
+        flow = self.make_flow()
+        up = flow.sink("up")
+        down = flow.sink("down")
+        assert up is not None and down is not None
+        up(build_client_hello("api.example.com", alpn=b"h3"))
+        down(build_server_hello(with_alpn=False, cipher=0x1301))
+        self.assertEqual(len(self.stacks), 1)
+        stack = self.stacks[0]
+        self.assertFalse(stack.provisional)
+        self.assertEqual(stack.alpn, "h3")      # 原始值仍是客户端偏好
+        self.assertEqual(stack.app, "h3?")      # 展示值带「未协商」标记
+        self.assertEqual(stack.alpn_source, LayerSource.CLIENT)
+        # cipher / TLS 版本仍取协商值
+        self.assertEqual(stack.cipher, "A128GCM")
+        self.assertEqual(stack.cipher_source, LayerSource.NEGOTIATED)
+        # 整行标记由 GUI 加在行首 `~`；行内 app 已带 `?`，统计键因此与真协商的 h3 分开
+        self.assertEqual(stack.key, ("api.example.com", "h3?", "TCP", "TLS1.3/A128GCM"))
 
     def test_non_tls_emits_nothing(self) -> None:
         flow = self.make_flow()
@@ -228,6 +259,43 @@ class QuicFlowTest(unittest.TestCase):
         flow.close()
         flow.close()
         self.assertEqual(len(self.stacks), 1)
+
+
+@unittest.skipUnless(_HAS_QUIC_FIXTURE, "需要 cryptography 才能构造加密 Initial")
+class QuicFlowEchTest(ConfigIsolatedCase):
+    """QUIC + ECH 端到端：外层 SNI 可解，且按掩护域名确证 ECH。
+
+    真 ECH 只加密 ClientHelloInner，ClientHelloOuter 的 SNI 仍是明文
+    （RFC 9849 §5），值是该 ECHConfig 的 ``public_name``。因此 h3 + ECH 的
+    正确表现是「拿到 cloudflare-ech.com + ECH 标记」，而**不是**用户真实域名。
+    """
+
+    PUBLIC_NAME = "cloudflare-ech.com"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.stacks: list[ProtocolStack] = []
+
+    def test_quic_ech_reports_outer_sni_and_mark(self) -> None:
+        flow = QuicFlow(self.stacks.append)
+        dcid, scid = b"\xa1" * 8, b"\xb2" * 4
+        record = build_client_hello(self.PUBLIC_NAME, alpn=b"h3", ech=b"\x5a" * 320)
+        flow.feed_client(
+            _encrypt_initial(
+                _QUIC_V1, header_dcid=dcid, header_scid=scid, crypto_data=_hello_message(record),
+            )
+        )
+        flow.close()
+        self.assertEqual(len(self.stacks), 1)
+        stack = self.stacks[0]
+        self.assertEqual(stack.domain, self.PUBLIC_NAME)
+        self.assertEqual(stack.transport_label, "QUIC/v1")
+        # 只有客户端方向：app 保持原值，整行标记 `~` 由 GUI 加在行首，避免双标记
+        self.assertTrue(stack.provisional)
+        self.assertEqual(stack.app, "h3")
+        self.assertEqual(stack.tls_version, "TLS1.3")
+        self.assertTrue(stack.ech_ext)
+        self.assertTrue(stack.ech)
 
 
 if __name__ == "__main__":

@@ -127,12 +127,19 @@ class UdpForwarder(asyncio.DatagramProtocol):
             return
 
         # 新客户端：先登记并缓存首包，上游 socket 建好后补发。
-        self._sessions[addr] = {
+        session = {
             "transport": None,
             "last_seen": time.monotonic(),
             "pending": [data],
             "flow": QuicFlow(self._on_stack),
         }
+        self._sessions[addr] = session
+        # FIX-7：首包**必须**也喂给嗅探。客户端首个 UDP 数据报就是承载
+        # ClientHello 的 Initial（CRYPTO offset 0），漏掉它整条会话永远解不出
+        # SNI（后续 Initial 的 CRYPTO 片段只有 offset>0，无法拼出 hello）。
+        # 此处虽与「先转发后嗅探」的书写顺序相反，但上游 socket 尚未建好、
+        # 转发必然延后，嗅探依旧是纯内存旁路，不改变转发字节与时序。
+        self._inspect(session, data)
         self._safe_session_change()
         task = asyncio.ensure_future(self._open_session(addr))
         self._session_tasks.add(task)

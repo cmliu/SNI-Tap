@@ -7,6 +7,9 @@ backstop 兜底）合并成一条。
 
 合并规则：
 - 拿到 ServerHello / 服务端 Initial → 三层一律取协商值，provisional=False；
+- **ALPN 例外**：TLS 1.3 的 ALPN 在加密的 EncryptedExtensions 里
+  （RFC 8446 §4.2.10），明文 ServerHello 不含该扩展，协商值缺失时回退到
+  客户端偏好（``alpn_source=CLIENT``），否则 TLS 1.3 的应用层恒为 ``-``；
 - 只拿到客户端方向 → 退回客户端偏好，provisional=True；
 - ``sni`` 只能来自客户端方向；QUIC 版本取自长包头（与 hello 无关）；
 - ``ech_ext`` 只取客户端方向的布尔判定，语义是「外层 ClientHelloOuter 明文
@@ -55,6 +58,16 @@ def _merge(
         source = LayerSource.CLIENT
         info = client_info
         provisional = True
+    # ALPN 单独处理：TLS 1.3 把 ALPN 放在**加密的** EncryptedExtensions 里
+    # （RFC 8446 §4.2.10），明文 ServerHello 中根本不存在该扩展；服务端方向
+    # 因此几乎总是解不出 ALPN。若此时仍按「三层一律取协商值」，任何 TLS 1.3
+    # 连接的应用层都会恒为 "-"（TCP 与 QUIC 同样中招）。
+    # 规则：协商值优先；协商值缺失时回退到客户端偏好（alpn_source=CLIENT）。
+    alpn = info.alpn
+    alpn_source = source
+    if alpn == UNKNOWN and client_info is not None and client_info.alpn != UNKNOWN:
+        alpn = client_info.alpn
+        alpn_source = LayerSource.CLIENT
     # ECH 只可能由客户端方向发起（外层 ClientHelloOuter 明文携带），
     # 服务端方向的同名字段仅覆盖罕见的 HRR 明文回带场景，不参与判定。
     # ech_ext = 原始观测（可能是 GREASE ECH）；ech = 确证生效
@@ -69,8 +82,8 @@ def _merge(
         tls_source=source,
         cipher=info.cipher,
         cipher_source=source,
-        alpn=info.alpn,
-        alpn_source=source,
+        alpn=alpn,
+        alpn_source=alpn_source,
         provisional=provisional,
         ech=ech,
         ech_ext=ech_ext,

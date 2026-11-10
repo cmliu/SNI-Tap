@@ -17,7 +17,7 @@
 |---|---|
 | TCP 转发 + TLS 双向嗅探 | 监听本地端口（默认 1234），逐连接转发；上行解析 ClientHello（SNI / 支持版本 / 套件 / ALPN），下行解析 ServerHello（协商值） |
 | UDP 转发 + QUIC Initial 嗅探 | 按客户端地址建立上游 socket 映射；双向解密 QUIC Initial（RFC 9001），重组 CRYPTO 帧还原 TLS 握手，兼容 QUIC / HTTP3（h3） |
-| 三层协议栈日志 | `HH:mm:ss  域名  应用层  传输层  安全层`，等宽字体，上限 5000 行自动滚动；仅有客户端方向时行尾加 `?`（provisional） |
+| 三层协议栈日志 | `HH:mm:ss  域名  应用层  传输层  安全层`，等宽字体，上限 5000 行自动滚动；仅有客户端方向时行首加 `~`（provisional，整行均为客户端偏好） |
 | ECH 识别 | **确证**真 ECH 时，日志安全层后追加琥珀色 `ECH`、统计行紧跟安全层标注 `ECH`、状态栏 footer 追加 `· ech K`。判据 = ClientHello 携带 `encrypted_client_hello`（`0xFE0D`）**且** 外层 SNI 命中 ECH 掩护域名名单（`ECHConfig.public_name`，默认 `cloudflare-ech.com`，可用环境变量 `SNITAP_ECH_PUBLIC_NAMES` 覆盖）。只看「扩展存在」会把 GREASE ECH 误当成真 ECH，故仅扩展存在的行**不标记**，只在 footer 计入 `· ech? X`。不解析密文；QUIC / HTTP3 同样覆盖 |
 | 四元组统计 | 统计键 = (域名, 应用层, 传输层, 安全层)，任一层不同即独立成行；安全层带 ` ECH` 后缀的行与非 ECH 行独立统计（后缀只加在确证行上，GREASE 行与普通行同键）；行内单行布局：域名 · 应用层 · 传输层 · 安全层 [· ECH] + 条形 + 次数，双击复制 TSV（可粘进 Excel） |
 | tcping 实时延迟 | 每 3 秒对目标 TCP 端口做一次握手测速（2 秒超时），状态区大字号显示 |
@@ -76,7 +76,10 @@ python -m snitap
 14:33:40  test.cmliussss.dpdns.org  h2  TCP  TLS1.3/A128GCM
 ```
 
-行尾 `?` 表示只观测到客户端方向（客户端偏好而非服务端协商值）。
+行首 `~` 表示只观测到客户端方向（客户端偏好而非服务端协商值）——整行都不可信。
+应用层值后的 `?`（如 `h3?`）是第三种状态：服务端 hello 已到，但 ALPN 协商值不可知
+（TLS 1.3 的 ALPN 在加密的 EncryptedExtensions 里），该值是客户端偏好，统计表里与
+真正协商到的 `h3` 分开计数。`~` 在行首、`?` 在字段内，两者位置分离，不会互相混淆。
 
 安全层后的 `ECH` 表示**确证本次握手是真正的 ECH**：外层 SNI 是 ECH 掩护域名
 （`ECHConfig` 的 `public_name`，Cloudflare 为 `cloudflare-ech.com`），且
@@ -215,7 +218,9 @@ SNI-Tap/
 
 **三层模型**：应用层 = ALPN；传输层 = TCP / QUIC/v1 / QUIC/- / UDP；安全层 = `TLS版本/套件`。
 每条连接 / 会话只发**一条**事件：拿到 ServerHello（或服务端 Initial）取协商值，
-否则退回客户端偏好并标记 `provisional`（日志行尾 `?`）。
+否则退回客户端偏好并标记 `provisional`（日志行首 `~`）。ALPN 另有第三种状态：
+TLS 1.3 的 ALPN 在加密的 EncryptedExtensions 里，服务端 hello 解不出协商值，
+此时显示客户端偏好并加后缀 `?`（`h3?`），与真协商到的 `h3` 在统计表分开计数。
 
 **QUIC Initial 解密**（仅 Initial、双向）：从客户端首个 Initial 的 DCID 按
 RFC 9001 派生双向密钥，header protection 按 FIX 正确处理（PN 长度在还原后

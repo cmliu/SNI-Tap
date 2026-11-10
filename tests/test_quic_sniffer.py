@@ -72,9 +72,29 @@ def _varint(value: int) -> bytes:
 
 
 def _expand_label(secret: bytes, label: bytes, length: int) -> bytes:
-    """TLS 1.3 HKDF-Expand-Label（夹具独立实现，不 import 被测模块）。"""
-    info = struct.pack("!H", length) + b"tls13 " + label
-    return HKDF(algorithm=hashes.SHA256(), length=length, salt=None, info=info).derive(secret)
+    """TLS 1.3 HKDF-Expand-Label（夹具独立实现，不 import 被测模块）。
+
+    FIX-6 回归：``info`` 必须按 RFC 8446 §7.1 的 HkdfLabel 编码——
+    ``uint16(length) || uint8(len("tls13 "+label)) || "tls13 "+label || uint8(0)``，
+    且只能做 HKDF-**Expand**（``secret`` 已是 PRK，再 Extract 会算错）。
+    本夹具早期版本与被测代码犯了同一个错，导致 4 个解密用例假通过；
+    正确性由 ``Rfc9001VectorTest`` 用官方测试向量锁死。
+    """
+    full_label = b"tls13 " + label
+    info = struct.pack("!H", length) + bytes([len(full_label)]) + full_label + b"\x00"
+    return _hkdf_expand(secret, info, length)
+
+
+def _hkdf_expand(prk: bytes, info: bytes, length: int) -> bytes:
+    """RFC 5869 §2.3 HKDF-Expand（纯 HMAC，不做 Extract）。"""
+    output = b""
+    block = b""
+    counter = 1
+    while len(output) < length:
+        block = hmac.new(prk, block + info + bytes([counter]), hashlib.sha256).digest()
+        output += block
+        counter += 1
+    return output[:length]
 
 
 def _derive_keys(version: int, dcid: bytes, is_client: bool) -> KeySet:
@@ -122,7 +142,9 @@ def _encrypt_initial(
     pn_len = 1
     plaintext = frame + b"\x00" * max(0, 20 - pn_len - (len(frame) + 16))
 
-    unprotected_first = 0xC0  # long + fixed + Initial + reserved 0 + PN len 1
+    unprotected_first = 0xD0 if version == _V2 else 0xC0
+    # v1: long+fixed+Initial(00)+reserved 0+PN len 1 → 0xC0
+    # v2: Initial 的类型号是 01（RFC 9369 §3.2）→ 0xD0
     body_len = pn_len + len(plaintext) + 16
     header = (
         bytes([unprotected_first])
@@ -154,6 +176,137 @@ def _make_client_hello_record(**kwargs) -> bytes:
     return build_client_hello("quic.example.org", alpn=b"h3", **kwargs)
 
 
+# ---------------------------------------------------------------- 密钥派生向量
+
+
+@unittest.skipUnless(_HAS_CRYPTO, "需要 cryptography")
+class Rfc9001VectorTest(unittest.TestCase):
+    """RFC 9001 附录 A.1 官方测试向量：锁死 Initial 密钥派生。
+
+    FIX-6 背景：``hkdf_expand_label`` 曾同时犯两个错——
+    info 缺 label 长度前缀与空 context 长度字节、且用 ``HKDF(...).derive()``
+    多做了一次 Extract。两处错误叠加后**任何真实 Initial 都无法解密**，
+    而当时的手写加密夹具犯了同一个错，4 个解密用例因此假通过。
+    本用例直接比对 RFC 公布的十六进制，夹具再也不能与实现共享同一个 bug。
+    """
+
+    DCID = bytes.fromhex("8394c8f03e515708")
+
+    def test_client_and_server_initial_keys(self) -> None:
+        client = quic_crypto.initial_keys(_V1, self.DCID, True)
+        server = quic_crypto.initial_keys(_V1, self.DCID, False)
+        assert client is not None and server is not None
+        self.assertEqual(client.key.hex(), "1f369613dd76d5467730efcbe3b1a22d")
+        self.assertEqual(client.iv.hex(), "fa044b2f42a3fd3b46fb255c")
+        self.assertEqual(client.hp.hex(), "9f50449e04a0e810283a1e9933adedd2")
+        self.assertEqual(server.key.hex(), "cf3a5331653c364c88f0f379b6067e37")
+        self.assertEqual(server.iv.hex(), "0ac1493ca1905853b0bba03e")
+        self.assertEqual(server.hp.hex(), "c206b8d9b9f0f37644430b490eeaa314")
+
+    def test_secrets_match_rfc_vectors(self) -> None:
+        initial_secret = hmac.new(_CRYPTO_SALT[_V1], self.DCID, hashlib.sha256).digest()
+        self.assertEqual(
+            initial_secret.hex(),
+            "7db5df06e7a69e432496adedb00851923595221596ae2ae9fb8115c1e9ed0a44",
+        )
+        self.assertEqual(
+            quic_crypto.hkdf_expand_label(initial_secret, b"client in", 32).hex(),
+            "c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea",
+        )
+        self.assertEqual(
+            quic_crypto.hkdf_expand_label(initial_secret, b"server in", 32).hex(),
+            "3c199828fd139efd216c155ad844cc81fb82fa8d7446fa7d78be803acdda951b",
+        )
+
+    def test_fixture_matches_rfc_vectors(self) -> None:
+        """夹具自身也必须命中官方向量，否则它无法守门被测实现。"""
+        keys = _derive_keys(_V1, self.DCID, True)
+        self.assertEqual(keys.key.hex(), "1f369613dd76d5467730efcbe3b1a22d")
+        self.assertEqual(keys.iv.hex(), "fa044b2f42a3fd3b46fb255c")
+        self.assertEqual(keys.hp.hex(), "9f50449e04a0e810283a1e9933adedd2")
+
+
+class HkdfExpandBoundaryTest(unittest.TestCase):
+    """``hkdf_expand`` 自身的 RFC 5869 向量与长度边界（QA 补充）。
+
+    ``Rfc9001VectorTest`` 只覆盖「label 长度 12/16/32」，恰好都不跨块边界
+    （SHA-256 一块 32 字节），因此 counter 递增逻辑没有被真正压到。这里用
+    RFC 5869 附录 A.1（Test Case 1，L=42，跨两块）把多块路径钉死。
+    """
+
+    # RFC 5869 附录 A.1：IKM/SALT/info 均为十六进制常量
+    IKM = bytes.fromhex("0b" * 22)
+    SALT = bytes.fromhex("000102030405060708090a0b0c")
+    INFO = bytes.fromhex("f0f1f2f3f4f5f6f7f8f9")
+    PRK_HEX = "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5"
+    OKM_HEX = (
+        "3cb25f25faacd57a90434f64d0362f2a"
+        "2d2d0a90cf1a5a4c5db02d56ecc4c5bf"
+        "34007208d5b887185865"
+    )
+
+    def test_prk_matches_rfc5869(self) -> None:
+        prk = hmac.new(self.SALT, self.IKM, hashlib.sha256).digest()
+        self.assertEqual(prk.hex(), self.PRK_HEX)
+
+    def test_multi_block_okm_matches_rfc5869(self) -> None:
+        """L=42 跨 2 块，验证 T(i) 的 counter 递增与拼接顺序。"""
+        prk = hmac.new(self.SALT, self.IKM, hashlib.sha256).digest()
+        self.assertEqual(quic_crypto.hkdf_expand(prk, self.INFO, 42).hex(), self.OKM_HEX)
+
+    def test_zero_length_returns_empty(self) -> None:
+        """length=0 返回空串（QUIC 不会用到，但不得抛错/返回垃圾）。"""
+        self.assertEqual(quic_crypto.hkdf_expand(b"\x01" * 32, b"ctx", 0), b"")
+
+    def test_exactly_255_blocks_is_allowed(self) -> None:
+        """RFC 5869 §2.3 上限 L <= 255*HashLen；恰好 255 块必须可算。"""
+        out = quic_crypto.hkdf_expand(b"\x01" * 32, b"ctx", 255 * 32)
+        self.assertEqual(len(out), 255 * 32)
+
+    def test_over_255_blocks_raises(self) -> None:
+        """溢出上限必须显式抛 ValueError，而不是静默截断/无限循环。"""
+        with self.assertRaises(ValueError):
+            quic_crypto.hkdf_expand(b"\x01" * 32, b"ctx", 255 * 32 + 1)
+
+
+class CryptoOffsetZeroTest(unittest.TestCase):
+    """FIX-7 的语义证明（不依赖 UdpForwarder 实现细节）。
+
+    QUIC 的 CRYPTO 流是**有序字节流**，TLS 握手消息头（type + 3 字节长度）
+    在 offset 0。丢掉承载 offset=0 的首个 Initial 后，只靠后续片段永远凑不出
+    一条完整握手消息——这正是「只显示 QUIC/v1、域名与签名全是 -」的成因。
+    """
+
+    @unittest.skipUnless(_HAS_CRYPTO, "需要 cryptography")
+    def test_missing_offset_zero_never_resolves_then_resolves_when_filled(self) -> None:
+        quic_crypto.reset_cache()
+        dcid, scid = b"\xa1" * 8, b"\xb2" * 4
+        message = _hello_message(_make_client_hello_record())
+        split = len(message) // 2
+
+        sniffer = QuicSniffer(CLIENT)
+        # 模拟「首包从未喂给嗅探」：只喂 offset=split 的后续片段
+        sniffer.feed(
+            _encrypt_initial(
+                _V1, header_dcid=dcid, header_scid=scid,
+                crypto_offset=split, crypto_data=message[split:], pn=1,
+            )
+        )
+        self.assertIsNone(sniffer.info)  # 缺 offset 0，拼不出 hello
+        self.assertFalse(sniffer.finished)
+
+        # 补上 offset=0 的片段 → 乱序缓冲被吐出，立刻解出
+        sniffer.feed(
+            _encrypt_initial(
+                _V1, header_dcid=dcid, header_scid=scid,
+                crypto_offset=0, crypto_data=message[:split], pn=0,
+            )
+        )
+        self.assertTrue(sniffer.finished)
+        assert sniffer.info is not None
+        self.assertEqual(sniffer.info.sni, "quic.example.org")
+
+
 # ---------------------------------------------------------------- 结构解析用例
 
 
@@ -162,10 +315,18 @@ class HeaderStructureTest(unittest.TestCase):
 
     def test_looks_like_initial(self) -> None:
         self.assertTrue(looks_like_initial(b"\xc0\x00\x00\x00\x01"))
-        self.assertFalse(looks_like_initial(b"\xd0\x00\x00\x00\x01"))  # 0-RTT
+        self.assertFalse(looks_like_initial(b"\xd0\x00\x00\x00\x01"))  # v1 0-RTT
         self.assertFalse(looks_like_initial(b"\xe0\x00\x00\x00\x01"))  # Handshake
         self.assertFalse(looks_like_initial(b"\x40\x00\x00\x00\x01"))  # 短包头
         self.assertFalse(looks_like_initial(b""))
+        self.assertFalse(looks_like_initial(b"\xc0\x00"))
+
+    def test_looks_like_initial_v2_type_mapping(self) -> None:
+        """RFC 9369 §3.2：v2 的 Initial 是 0b01，0b00 变成 Retry。"""
+        self.assertTrue(looks_like_initial(b"\xd2\x6b\x33\x43\xcf"))   # v2 Initial
+        self.assertFalse(looks_like_initial(b"\xc2\x6b\x33\x43\xcf"))  # v2 Retry
+        self.assertFalse(looks_like_initial(b"\xe2\x6b\x33\x43\xcf"))  # v2 Handshake
+        self.assertFalse(looks_like_initial(b"\xf2\x6b\x33\x43\xcf"))  # v2 0-RTT
 
     def test_parse_long_header(self) -> None:
         dcid, scid = b"\x11" * 8, b"\x22" * 4
@@ -379,6 +540,98 @@ class QuicSnifferDecryptTest(unittest.TestCase):
         sniffer = self.sniff([datagram] * (MAX_ATTEMPTS + 1))
         self.assertTrue(sniffer.finished)
         self.assertIsNone(sniffer.info)
+
+
+@unittest.skipUnless(_HAS_CRYPTO, "需要 cryptography")
+class EchAndFragmentationTest(unittest.TestCase):
+    """ECH 场景 + 大 ClientHello 分片：外层 SNI 仍可解，且在尝试预算内。
+
+    背景：真 ECH 只加密 **ClientHelloInner**，外层 ClientHelloOuter 的 SNI
+    仍是明文（RFC 9849 §5），值是该 ECHConfig 的 ``public_name``
+    （Cloudflare 为 ``cloudflare-ech.com``）。因此被动嗅探能拿到的是
+    outer SNI + ``0xFE0D`` 扩展是否存在，拿不到用户真正访问的域名。
+    另一后果：带 ECH 的 ClientHello 普遍 >1150 字节，会被 QUIC 拆成
+    2~3 个 Initial 包，必须靠 CRYPTO 流重组才能凑齐。
+    """
+
+    def setUp(self) -> None:
+        quic_crypto.reset_cache()
+
+    @staticmethod
+    def _ech_payload(size: int) -> bytes:
+        """构造一段无结构随机字节，模拟 encrypted_client_hello 扩展体。"""
+        return bytes((i * 37 + 11) & 0xFF for i in range(size))
+
+    def _message(self, ech_size: int) -> bytes:
+        record = build_client_hello(
+            "cloudflare-ech.com", alpn=b"h3", ech=self._ech_payload(ech_size),
+        )
+        return _hello_message(record)
+
+    def test_ech_outer_sni_single_datagram(self) -> None:
+        dcid, scid = b"\xa1" * 8, b"\xb2" * 4
+        datagram = _encrypt_initial(
+            _V1, header_dcid=dcid, header_scid=scid, crypto_data=self._message(300),
+        )
+        sniffer = QuicSniffer(CLIENT)
+        sniffer.feed(datagram)
+        self.assertTrue(sniffer.finished)
+        assert sniffer.info is not None
+        # 拿得到的是外层掩护域名，而不是用户真实访问的域名
+        self.assertEqual(sniffer.info.sni, "cloudflare-ech.com")
+        self.assertTrue(sniffer.info.ech)
+        self.assertEqual(sniffer.info.alpn, "h3")
+
+    def test_large_ech_hello_split_across_two_initials(self) -> None:
+        dcid, scid = b"\xa1" * 8, b"\xb2" * 4
+        message = self._message(1200)  # 远超单个 Initial 的承载能力
+        self.assertGreater(len(message), 1200)
+        split = 1150
+        datagrams = [
+            _encrypt_initial(
+                _V1, header_dcid=dcid, header_scid=scid,
+                crypto_offset=0, crypto_data=message[:split], pn=0,
+            ),
+            _encrypt_initial(
+                _V1, header_dcid=dcid, header_scid=scid,
+                crypto_offset=split, crypto_data=message[split:], pn=1,
+            ),
+        ]
+        sniffer = QuicSniffer(CLIENT)
+        sniffer.feed(datagrams[0])
+        self.assertFalse(sniffer.finished)  # 首片不足以还原 hello
+        sniffer.feed(datagrams[1])
+        self.assertTrue(sniffer.finished)
+        assert sniffer.info is not None
+        self.assertEqual(sniffer.info.sni, "cloudflare-ech.com")
+        self.assertTrue(sniffer.info.ech)
+
+    def test_attempt_budget_covers_max_fragments(self) -> None:
+        """尝试预算的边界：MAX_ATTEMPTS 片可解，再多一片就放弃（已知上限）。"""
+        dcid, scid = b"\xa1" * 8, b"\xb2" * 4
+        message = self._message(1200)
+        chunk = -(-len(message) // MAX_ATTEMPTS)  # 向上取整
+        datagrams = [
+            _encrypt_initial(
+                _V1, header_dcid=dcid, header_scid=scid,
+                crypto_offset=offset, crypto_data=message[offset:offset + chunk], pn=index,
+            )
+            for index, offset in enumerate(range(0, len(message), chunk))
+        ]
+        self.assertEqual(len(datagrams), MAX_ATTEMPTS)
+        sniffer = QuicSniffer(CLIENT)
+        for datagram in datagrams:
+            sniffer.feed(datagram)
+        self.assertTrue(sniffer.finished)
+        assert sniffer.info is not None
+        self.assertEqual(sniffer.info.sni, "cloudflare-ech.com")
+
+    def test_short_header_does_not_consume_attempt_budget(self) -> None:
+        """FIX-8：1-RTT 短包头不可能携带 Initial 的 CRYPTO，不能占用尝试预算。"""
+        sniffer = QuicSniffer(CLIENT)
+        for _ in range(MAX_ATTEMPTS * 3):
+            sniffer.feed(b"\x40" + b"\x00" * 300)  # 短包头
+        self.assertFalse(sniffer.finished)
 
 
 @unittest.skipIf(_HAS_CRYPTO, "仅验证依赖缺失时的降级路径")

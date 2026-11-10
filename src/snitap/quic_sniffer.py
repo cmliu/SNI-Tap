@@ -22,7 +22,7 @@ log = logging.getLogger(__name__)
 
 INITIAL_MAX_DATAGRAM = 1500  # 超过则视作异常尺寸直接跳过
 MAX_CRYPTO_BUFFER = 16 * 1024
-MAX_ATTEMPTS = 4             # 喂入 MAX_ATTEMPTS 个报文仍无果即放弃
+MAX_ATTEMPTS = 4             # 喂入 MAX_ATTEMPTS 个**长包头**报文仍无果即放弃
 MIN_DATAGRAM = 60            # 小于则视作异常尺寸直接跳过
 
 
@@ -55,11 +55,27 @@ class LongHeader:
     token_len: int
 
 
+QUIC_V2 = 0x6B3343CF
+
+
 def looks_like_initial(data: bytes) -> bool:
-    """首字节判型：long header + fixed bit 且包类型为 Initial(00)。"""
-    if not data:
+    """首字节判型：long header + fixed bit 且**该版本**的包类型为 Initial。
+
+    RFC 9369 §3.2 把 v2 的包类型号改了：v1 的 Initial 是 ``0b00``，
+    v2 的 Initial 是 ``0b01``（0b00 变成 Retry）。早期实现只用 v1 语义判型，
+    真实的 v2 客户端首包（首字节如 ``0xd2``）会被当成 0-RTT 直接丢掉，
+    表现与「h3 抓不到 SNI」完全一致。未知版本按 v1 语义处理。
+    """
+    if len(data) < 5:
         return False
-    return (data[0] & 0xC0) == 0xC0 and ((data[0] & 0x30) >> 4) == 0
+    first = data[0]
+    if (first & 0xC0) != 0xC0:
+        return False
+    packet_type = (first & 0x30) >> 4
+    version = int.from_bytes(data[1:5], "big")
+    if version == QUIC_V2:
+        return packet_type == 1
+    return packet_type == 0
 
 
 def parse_long_header(data: bytes) -> LongHeader | None:
@@ -220,12 +236,18 @@ class QuicSniffer:
             return
         if len(datagram) < MIN_DATAGRAM or len(datagram) > INITIAL_MAX_DATAGRAM:
             return  # 异常尺寸跳过，不消耗尝试次数
-        self._attempts += 1
+        # FIX-8：只有 Initial 报文才消耗尝试预算。短包头（1-RTT）与 Handshake /
+        # 0-RTT / Retry 包按定义都不携带 Initial 的 CRYPTO 帧；早期版本把每个
+        # 数据报都计数，导致「握手后紧跟的几个包」把预算吃光——带 ECH 的
+        # ClientHello 会跨 2~3 个 Initial，预算被噪音挤占后就解不出 SNI。
+        is_initial = looks_like_initial(datagram)
+        if is_initial:
+            self._attempts += 1
         try:
             self._process(datagram)
         except Exception:
             log.debug("QUIC 嗅探异常（忽略，继续转发）", exc_info=True)
-        if not self._finished and self._attempts >= MAX_ATTEMPTS:
+        if not self._finished and is_initial and self._attempts >= MAX_ATTEMPTS:
             self._finished = True  # 尝试耗尽，放弃（info 保持 None）
 
     # ------------------------------------------------------------------ 内部

@@ -54,15 +54,41 @@ def available() -> bool:
 
 
 def hkdf_expand_label(secret: bytes, label: bytes, length: int) -> bytes:
-    """TLS 1.3 HKDF-Expand-Label（RFC 8446 §7.1，info 不含 context）。
+    """TLS 1.3 HKDF-Expand-Label（RFC 8446 §7.1）。
 
-    info = len(2B 大端) + "tls13 " + label（注意尾随空格）。
+    结构（RFC 8446 §7.1 的 HkdfLabel）：
+
+    .. code-block:: text
+
+        struct {
+            uint16 length;                      // 输出长度
+            opaque label<7..255> = "tls13 " + Label;  // 1 字节长度前缀
+            opaque context<0..255> = "";              // QUIC 恒为空，仍需 1 字节长度
+        } HkdfLabel;
+
+    两个易错点（FIX-6，均会导致密钥全错、解密恒定 InvalidTag）：
+    1. ``info`` 必须带 **label 的 1 字节长度前缀** 与 **context 的 1 字节长度（0）**；
+    2. 这里只能做 HKDF-**Expand**。传入的 ``secret`` 已经是 PRK（初始密钥由
+       HKDF-Extract 得到），再用 ``HKDF(...).derive()`` 会多做一次 Extract，
+       结果与 RFC 9001 附录 A 的测试向量不符。
     """
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    full_label = b"tls13 " + label
+    info = struct.pack("!H", length) + bytes([len(full_label)]) + full_label + b"\x00"
+    return hkdf_expand(secret, info, length)
 
-    info = struct.pack("!H", length) + b"tls13 " + label
-    return HKDF(algorithm=hashes.SHA256(), length=length, salt=None, info=info).derive(secret)
+
+def hkdf_expand(prk: bytes, info: bytes, length: int) -> bytes:
+    """RFC 5869 §2.3 HKDF-Expand（纯 HMAC-SHA256，**不做** Extract）。"""
+    output = bytearray()
+    block = b""
+    counter = 1
+    while len(output) < length:
+        if counter > 255:
+            raise ValueError("HKDF-Expand 超出 255 块上限")
+        block = hmac.new(prk, block + info + bytes([counter]), hashlib.sha256).digest()
+        output.extend(block)
+        counter += 1
+    return bytes(output[:length])
 
 
 def initial_keys(version: int, dcid: bytes, is_client: bool) -> KeySet | None:

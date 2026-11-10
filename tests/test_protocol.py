@@ -1,8 +1,8 @@
 """protocol.py 共享契约的单元测试。
 
-覆盖：GREASE 全 16 个值、三张名称表的单射性、key 不含 provisional、
-security 三种形态、has_content 四种组合、transport_label 的 FIX-5 表格、
-ECH 标记（security_label / key 分离 / StackRow.has_ech）、
+覆盖：GREASE 全 16 个值、三张名称表的单射性、key 不含 provisional 原值、
+app 的 `?` 后缀四分支与统计分行、security 三种形态、has_content 四种组合、
+transport_label 的 FIX-5 表格、ECH 标记（security_label / key 分离 / StackRow.has_ech）、
 StackRow.from_stack 与 caption 的一致性。
 """
 
@@ -16,6 +16,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
 from snitap.protocol import (
     ECH_MARK,
+    PROVISIONAL_MARK,
     UNKNOWN,
     LayerSource,
     ProtocolStack,
@@ -27,6 +28,7 @@ from snitap.protocol import (
     tls_version_name,
     transport_label,
 )
+from snitap.stats import Stats
 
 
 class GreaseTest(unittest.TestCase):
@@ -150,6 +152,78 @@ class ProtocolStackTest(unittest.TestCase):
             alpn="h3",
         )
         self.assertEqual(stack.caption(), "h3 · QUIC/v1 · TLS1.3/A128GCM")
+
+
+class AppProvisionalMarkTest(unittest.TestCase):
+    """``app`` 的 `?` 后缀：区分「已协商」与「ALPN 不可知、回退客户端偏好」。
+
+    背景：TLS 1.3 把 ALPN 放在**加密的** EncryptedExtensions 里
+    （RFC 8446 §4.2.10），明文 ServerHello 解不出协商值，``_merge`` 只能回退到
+    客户端偏好。若不标记，「客户端偏好 h3」与「真协商到 h3」像素级一致。
+    """
+
+    BASE = dict(
+        sni="api.example.com",
+        alpn="h3",
+        tls_version="TLS1.3",
+        cipher="A128GCM",
+        transport="TCP",
+    )
+
+    def test_client_only_keeps_raw_value(self) -> None:
+        """只有 ClientHello：整行标记由 GUI 加在行首 ``~``，app 不许再加。"""
+        stack = ProtocolStack(**self.BASE, provisional=True, alpn_source=LayerSource.CLIENT)
+        self.assertEqual(stack.app, "h3")
+
+    def test_server_hello_but_alpn_unknown_is_marked(self) -> None:
+        """服务端 hello 已到、ALPN 不可知、回退客户端偏好 → ``h3?``。"""
+        stack = ProtocolStack(**self.BASE, provisional=False, alpn_source=LayerSource.CLIENT)
+        self.assertEqual(stack.app, f"h3{PROVISIONAL_MARK}")
+        self.assertEqual(stack.alpn, "h3")  # 原始值不被污染
+
+    def test_negotiated_alpn_is_not_marked(self) -> None:
+        """真正协商到的 ALPN（TLS 1.2 明文 ServerHello 亦同）不加 `?`。"""
+        stack = ProtocolStack(**self.BASE, provisional=False, alpn_source=LayerSource.NEGOTIATED)
+        self.assertEqual(stack.app, "h3")
+
+    def test_unknown_alpn_never_gets_mark(self) -> None:
+        """ALPN 未知时保持 ``-``，不产出 ``-?``。"""
+        stack = ProtocolStack(
+            **{**self.BASE, "alpn": UNKNOWN},
+            provisional=False,
+            alpn_source=LayerSource.CLIENT,
+        )
+        self.assertEqual(stack.app, UNKNOWN)
+
+    def test_tls12_negotiated_alpn_keeps_plain_value(self) -> None:
+        """TLS 1.2 的 ALPN 在明文 ServerHello 里，协商值已知 → 原值、无 `?`。"""
+        stack = ProtocolStack(
+            sni="legacy.example.com",
+            alpn="http/1.1",
+            tls_version="TLS1.2",
+            cipher="0xcca8",
+            transport="TCP",
+            provisional=False,
+            alpn_source=LayerSource.NEGOTIATED,
+        )
+        self.assertEqual(stack.app, "http/1.1")
+        self.assertEqual(stack.key, ("legacy.example.com", "http/1.1", "TCP", "TLS1.2/0xcca8"))
+
+    def test_stats_splits_negotiated_and_fallback_rows(self) -> None:
+        """``h3`` 与 ``h3?`` 必须是两条统计行（本修复的另一半价值）。"""
+        stats = Stats()
+        negotiated = ProtocolStack(**self.BASE, provisional=False, alpn_source=LayerSource.NEGOTIATED)
+        fallback = ProtocolStack(**self.BASE, provisional=False, alpn_source=LayerSource.CLIENT)
+        stats.add_stack(negotiated)
+        stats.add_stack(negotiated)
+        stats.add_stack(fallback)
+        rows = stats.snapshot_rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(stats.distinct, 2)
+        by_app = {row.app: row.count for row in rows}
+        self.assertEqual(by_app, {"h3": 2, "h3?": 1})
+        # 计数小计仍等于总上报数
+        self.assertEqual(sum(by_app.values()), stats.total_hits)
 
 
 class StackRowTest(unittest.TestCase):

@@ -3,8 +3,13 @@
 每行固定五段：``时间戳  域名  应用层  传输层  安全层``（两空格分隔），
 顺序固定为 应用层 → 传输层 → 安全层；安全层后可选 ``ECH`` 标记（两空格
 分隔，琥珀色，表示确证客户端发起了真 ECH——外层扩展存在 ∧ 外层 SNI 是
-ECH 掩护域名，GREASE ECH 不标记），provisional 行尾加 ``?``，
-因此行尾顺序是 安全层 → ECH → ``?``。
+ECH 掩护域名，GREASE ECH 不标记）。
+
+``provisional``（整行都是客户端偏好、未经服务端确认）在**行首**加 ``~``，
+而不是行尾加 ``?``：行尾符号会紧贴最后一个字段（渲染成 ``ECH?``），容易被
+误读为该字段本身不确定；行首则与所有字段脱离，且与 app 层内部的 ``h3?``
+（仅该字段未知）在位置上明确区分。非 provisional 行在行首留**一个空格占位**，
+保证各行时间戳列始终对齐。
 
 Tk 的 ``Text`` 没有 HTML 富文本，改用 tag 实现「时间戳弱化、域名青色」；
 批量追加时先一次性 insert 整块文本，再用**五条** ``tag_add`` 批量打范围
@@ -30,6 +35,10 @@ _LOG_SEP = "  "
 
 # ECH 标记文案（与 protocol.ECH_MARK 一致，GUI 层不 import 协议模块）
 _ECH_MARK = "ECH"
+
+# 整行推测（provisional）的行首标记：与 app 层内部的 "?" 分离在两个位置，
+# 避免「字段不确定」和「整行不确定」两种语义在视觉上混为一谈。
+_PROVISIONAL_PREFIX = "~"
 
 
 @dataclass(frozen=True)
@@ -113,6 +122,7 @@ class LogPanel(tk.Frame):
         self.text.tag_configure("app", foreground=t.muted)      # 应用层
         self.text.tag_configure("security", foreground=t.green)  # 安全层
         self.text.tag_configure("ech", foreground=t.amber)      # ECH 标记
+        self.text.tag_configure("mark", foreground=t.amber)     # 行首 provisional 标记
         self.text.tag_configure("hint", foreground=t.dim)
         self.text.configure(
             bg=t.pane,
@@ -149,13 +159,16 @@ class LogPanel(tk.Frame):
         rendered: list[tuple[str, list[tuple[str, int, int]]]] = []
 
         for entry in entries:
-            mark = "?" if entry.provisional else ""
+            # 整行推测用行首 "~"；非推测行留一个空格占位，保证时间戳列对齐。
+            mark = _PROVISIONAL_PREFIX if entry.provisional else " "
             line = (
-                f"{entry.ts}{_LOG_SEP}{entry.domain}{_LOG_SEP}{entry.app}"
+                f"{mark}{entry.ts}{_LOG_SEP}{entry.domain}{_LOG_SEP}{entry.app}"
                 f"{_LOG_SEP}{entry.transport}{_LOG_SEP}{entry.security}"
             )
             ranges: list[tuple[str, int, int]] = []
-            pos = 0
+            if entry.provisional:
+                ranges.append(("mark", 0, len(mark)))
+            pos = len(mark)
             for tag, text in (
                 ("dim", entry.ts),
                 ("dom", entry.domain),
@@ -173,7 +186,6 @@ class LogPanel(tk.Frame):
                 start = pos
                 pos += len(_ECH_MARK)
                 ranges.append(("ech", start, pos))
-            line += mark
             rendered.append((line, ranges))
             self._entries.append(entry)
 
@@ -182,15 +194,15 @@ class LogPanel(tk.Frame):
         self.text.configure(state="normal")
         self.text.insert("end", block)
 
-        # 五条批量 tag_add：每条传平铺的 [start, end, start, end, …]
+        # 六条批量 tag_add：每条传平铺的 [start, end, start, end, …]
         tag_ranges: dict[str, list[str]] = {
-            "dim": [], "dom": [], "app": [], "security": [], "ech": [],
+            "dim": [], "dom": [], "app": [], "security": [], "ech": [], "mark": [],
         }
         for offset, (_line, ranges) in enumerate(rendered):
             line_no = base + offset + 1
             for tag, start, end in ranges:
                 tag_ranges[tag].extend((f"{line_no}.{start}", f"{line_no}.{end}"))
-        for tag in ("dim", "dom", "app", "security", "ech"):
+        for tag in ("dim", "dom", "app", "security", "ech", "mark"):
             if tag_ranges[tag]:
                 self.text.tag_add(tag, *tag_ranges[tag])
 
