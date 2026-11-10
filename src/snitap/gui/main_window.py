@@ -16,6 +16,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 from typing import Callable, Optional, Union
 
+from .. import __version__
 from ..config import (
     DEFAULT_LISTEN_PORT,
     DEFAULT_TARGET_HOST,
@@ -277,7 +278,8 @@ class MainWindow:
 
     def _configure_window(self) -> None:
         """标题、尺寸、图标、标题栏上色与禁用最大化。"""
-        self.root.title("SNI域名探测器")
+        # 标题带版本号：用户不用进「关于」就知道自己跑的是哪一版
+        self.root.title(f"SNI域名探测器 v{__version__}")
         self._paint(self.root, bg="bg")  # 根窗口底色也要随主题重刷
         self.root.geometry(f"{px(WINDOW_W)}x{px(WINDOW_H)}")
         self.root.minsize(px(640), px(420))
